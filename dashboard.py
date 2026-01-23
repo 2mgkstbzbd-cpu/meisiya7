@@ -2206,10 +2206,21 @@ if uploaded_file:
             with tab1:
                 st.caption(f"筛选口径：省区={sel_prov}｜经销商={sel_dist}｜产品大类={st.session_state.get('main_sel_cat', '全部')}")
 
-                def _kpi_card(icon, title, main_value, sub_pairs):
-                    rows_html = ""
-                    for a, b in sub_pairs:
-                        rows_html += f'<div class="out-kpi-sub"><span>{a}</span><span>{b}</span></div>'
+                # --- Common Helpers for Tab 1 ---
+                def _fmt_wan(x): return fmt_num((x or 0) / 10000)
+                def _fmt_pct(x): return fmt_pct_ratio(x) if x is not None else "—"
+                def _arrow(x): return "↑" if x and x>0 else ("↓" if x and x<0 else "")
+                def _trend_cls(x): return "trend-up" if x and x > 0 else ("trend-down" if x and x < 0 else "trend-neutral")
+
+                # Card Renderer for Performance (Tab 7 Style)
+                def _render_perf_card(title, icon, val_wan, target_wan, rate, yoy_val_wan, yoy_pct):
+                    trend_cls = _trend_cls(yoy_pct)
+                    arrow = _arrow(yoy_pct)
+                    rate_txt = _fmt_pct(rate)
+                    yoy_txt = _fmt_pct(yoy_pct)
+                    pct_val = min(max(rate * 100 if rate else 0, 0), 100)
+                    prog_color = "#28A745" if rate and rate >= 1.0 else ("#FFC107" if rate and rate >= 0.8 else "#DC3545")
+
                     st.markdown(f"""
                     <div class="out-kpi-card">
                         <div class="out-kpi-bar"></div>
@@ -2217,8 +2228,45 @@ if uploaded_file:
                             <div class="out-kpi-ico">{icon}</div>
                             <div class="out-kpi-title">{title}</div>
                         </div>
-                        <div class="out-kpi-val">{main_value}</div>
-                        {rows_html}
+                        <div class="out-kpi-val">¥ {val_wan}万</div>
+                        <div class="out-kpi-sub2" style="margin-top:8px;">
+                            <span>达成率</span>
+                            <span style="font-weight:800; color:{prog_color}">{rate_txt}</span>
+                        </div>
+                        <div class="out-kpi-progress" style="margin-top:6px;">
+                            <div class="out-kpi-progress-bar" style="background:{prog_color}; width:{pct_val}%;"></div>
+                        </div>
+                        <div class="out-kpi-sub2" style="margin-top:10px;">
+                            <span>目标</span>
+                            <span>{target_wan}万</span>
+                        </div>
+                        <div class="out-kpi-sub2">
+                            <span>同期</span>
+                            <span>{yoy_val_wan}万</span>
+                        </div>
+                        <div class="out-kpi-sub2">
+                            <span>同比</span>
+                            <span class="{trend_cls}">{arrow} {yoy_txt}</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                # Card Renderer for Outbound/Scan (General Style)
+                def _render_general_card(title, icon, main_val, sub_items):
+                    # sub_items: list of (label, value_html)
+                    rows_html = ""
+                    for label, val_html in sub_items:
+                        rows_html += f'<div class="out-kpi-sub2"><span>{label}</span><span>{val_html}</span></div>'
+                    
+                    st.markdown(f"""
+                    <div class="out-kpi-card">
+                        <div class="out-kpi-bar"></div>
+                        <div class="out-kpi-head">
+                            <div class="out-kpi-ico">{icon}</div>
+                            <div class="out-kpi-title">{title}</div>
+                        </div>
+                        <div class="out-kpi-val">{main_val}</div>
+                        <div style="margin-top:10px;">{rows_html}</div>
                     </div>
                     """, unsafe_allow_html=True)
 
@@ -2242,9 +2290,13 @@ if uploaded_file:
                             d = d[d['大分类'] == sel_bigcat]
                     return d
 
+                # ---------------------------------------------------------
+                # 1. 核心业绩指标 (From Tab 7)
+                # ---------------------------------------------------------
                 st.markdown("### 🚀 核心业绩指标")
                 df_perf = _filter_common(df_perf_raw)
                 if not df_perf.empty:
+                    # Data Prep
                     if '年份' in df_perf.columns:
                         df_perf['年份'] = pd.to_numeric(df_perf['年份'], errors='coerce').fillna(0).astype(int)
                     if '月份' in df_perf.columns:
@@ -2252,149 +2304,219 @@ if uploaded_file:
                     amt_col = '发货金额' if '发货金额' in df_perf.columns else None
                     if amt_col:
                         df_perf[amt_col] = pd.to_numeric(df_perf[amt_col], errors='coerce').fillna(0)
-                    years_avail = [y for y in df_perf['年份'].unique().tolist() if y > 0] if '年份' in df_perf.columns else []
-                    perf_y = max(years_avail) if years_avail else 0
-                    months_avail = [m for m in df_perf[df_perf['年份'] == perf_y]['月份'].unique().tolist() if 1 <= m <= 12] if perf_y else []
-                    perf_m = max(months_avail) if months_avail else 0
+                    
+                    years_avail = sorted([y for y in df_perf['年份'].unique().tolist() if y > 2000])
+                    perf_y = max(years_avail) if years_avail else 2025
+                    months_avail = sorted([m for m in df_perf[df_perf['年份'] == perf_y]['月份'].unique().tolist() if 1 <= m <= 12])
+                    perf_m = max(months_avail) if months_avail else 1
                     last_y = perf_y - 1
-                    cur_m_df = df_perf[(df_perf['年份'] == perf_y) & (df_perf['月份'] == perf_m)]
-                    last_m_df = df_perf[(df_perf['年份'] == last_y) & (df_perf['月份'] == perf_m)]
-                    cur_m_amt = float(cur_m_df[amt_col].sum()) if amt_col else 0.0
-                    last_m_amt = float(last_m_df[amt_col].sum()) if amt_col else 0.0
-                    yoy_m = (cur_m_amt - last_m_amt) / last_m_amt if last_m_amt > 0 else 0.0
 
-                    cur_y_amt = float(df_perf[df_perf['年份'] == perf_y][amt_col].sum()) if amt_col else 0.0
-                    last_y_amt = float(df_perf[df_perf['年份'] == last_y][amt_col].sum()) if amt_col else 0.0
-                    yoy_y = (cur_y_amt - last_y_amt) / last_y_amt if last_y_amt > 0 else 0.0
+                    # Actuals
+                    cur_m_amt = df_perf[(df_perf['年份'] == perf_y) & (df_perf['月份'] == perf_m)][amt_col].sum() if amt_col else 0
+                    last_m_amt = df_perf[(df_perf['年份'] == last_y) & (df_perf['月份'] == perf_m)][amt_col].sum() if amt_col else 0
+                    cur_y_amt = df_perf[df_perf['年份'] == perf_y][amt_col].sum() if amt_col else 0
+                    last_y_amt = df_perf[df_perf['年份'] == last_y][amt_col].sum() if amt_col else 0
 
-                    target_ratio = None
+                    yoy_m = (cur_m_amt - last_m_amt) / last_m_amt if last_m_amt > 0 else 0
+                    yoy_y = (cur_y_amt - last_y_amt) / last_y_amt if last_y_amt > 0 else 0
+
+                    # Targets
+                    t_cur_m = 0.0
+                    t_cur_y = 0.0
                     if df_target_raw is not None and not getattr(df_target_raw, "empty", True):
                         df_t = df_target_raw.copy()
                         for c in ['省区', '品类']:
-                            if c in df_t.columns:
-                                df_t[c] = df_t[c].fillna('').astype(str).str.strip()
-                        if '月份' in df_t.columns:
-                            df_t['月份'] = pd.to_numeric(df_t['月份'], errors='coerce').fillna(0).astype(int)
-                        if '任务量' in df_t.columns:
-                            df_t['任务量'] = pd.to_numeric(df_t['任务量'], errors='coerce').fillna(0)
+                            if c in df_t.columns: df_t[c] = df_t[c].fillna('').astype(str).str.strip()
+                        if '月份' in df_t.columns: df_t['月份'] = pd.to_numeric(df_t['月份'], errors='coerce').fillna(0).astype(int)
+                        if '任务量' in df_t.columns: df_t['任务量'] = pd.to_numeric(df_t['任务量'], errors='coerce').fillna(0)
+                        
                         if sel_prov != '全部' and '省区' in df_t.columns:
                             df_t = df_t[df_t['省区'] == sel_prov]
+                        # Target usually doesn't filter by Distributor, but filters by Category
                         if sel_bigcat != '全部' and '品类' in df_t.columns:
                             df_t = df_t[df_t['品类'] == sel_bigcat]
-                        t_month = float(df_t[df_t['月份'] == perf_m]['任务量'].sum()) if perf_m else 0.0
-                        target_ratio = (cur_m_amt / t_month) if t_month > 0 else None
+                        
+                        t_cur_m = df_t[df_t['月份'] == perf_m]['任务量'].sum()
+                        t_cur_y = df_t['任务量'].sum() # Total Year Target
 
-                    c1, c2, c3 = st.columns(3)
+                    rate_m = (cur_m_amt / t_cur_m) if t_cur_m > 0 else None
+                    rate_y = (cur_y_amt / t_cur_y) if t_cur_y > 0 else None
+
+                    c1, c2 = st.columns(2)
                     with c1:
-                        _kpi_card("💰", f"本月业绩（{perf_m}月）", f"{fmt_num(cur_m_amt/10000)} 万", [
-                            ("同期(万)", f"{fmt_num(last_m_amt/10000)}"),
-                            ("同比", fmt_pct_ratio(yoy_m)),
-                        ])
+                        _render_perf_card(f"本月业绩（{perf_m}月）", "📅", _fmt_wan(cur_m_amt), _fmt_wan(t_cur_m), rate_m, _fmt_wan(last_m_amt), yoy_m)
                     with c2:
-                        _kpi_card("📈", f"本年累计业绩（{perf_y}年）", f"{fmt_num(cur_y_amt/10000)} 万", [
-                            ("同期(万)", f"{fmt_num(last_y_amt/10000)}"),
-                            ("同比", fmt_pct_ratio(yoy_y)),
-                        ])
-                    with c3:
-                        _kpi_card("🎯", "本月任务达成", fmt_pct_ratio(target_ratio) if target_ratio is not None else "—", [
-                            ("口径", "本月业绩/本月任务"),
-                            ("提示", "无任务表则为空"),
-                        ])
+                        _render_perf_card(f"年度累计业绩（{perf_y}年）", "🏆", _fmt_wan(cur_y_amt), _fmt_wan(t_cur_y), rate_y, _fmt_wan(last_y_amt), yoy_y)
                 else:
                     st.info("业绩数据为空或不含匹配字段")
 
-                st.markdown("### 🚚 出库关键指标")
-                df_out = _filter_common(df_q4_raw)
-                out_base = pd.DataFrame()
-                if not df_out.empty:
-                    tmp = df_out.copy()
-                    for c in ['年份', '月份']:
-                        if c in tmp.columns:
-                            tmp[c] = pd.to_numeric(tmp[c], errors='coerce').fillna(0).astype(int)
-                    if '日' in tmp.columns:
-                        tmp['日'] = pd.to_numeric(tmp['日'], errors='coerce').fillna(0).astype(int)
-                    else:
-                        cand = next((c for c in tmp.columns if '日期' in str(c)), None)
-                        if cand:
-                            dt = pd.to_datetime(tmp[cand], errors='coerce')
-                            tmp['年份'] = dt.dt.year
-                            tmp['月份'] = dt.dt.month
-                            tmp['日'] = dt.dt.day
-                    qty_col = '数量(箱)' if '数量(箱)' in tmp.columns else next((c for c in tmp.columns if '数量' in str(c) or '箱' in str(c)), None)
-                    if qty_col:
-                        tmp['数量(箱)'] = pd.to_numeric(tmp[qty_col], errors='coerce').fillna(0)
-                        out_base = tmp[tmp['年份'] > 0].copy()
-                if not out_base.empty:
-                    oy = int(out_base['年份'].max())
-                    om = int(out_base[out_base['年份'] == oy]['月份'].max())
-                    od = int(out_base[(out_base['年份'] == oy) & (out_base['月份'] == om)]['日'].max())
-                    today_boxes = float(out_base[(out_base['年份'] == oy) & (out_base['月份'] == om) & (out_base['日'] == od)]['数量(箱)'].sum())
-                    month_boxes = float(out_base[(out_base['年份'] == oy) & (out_base['月份'] == om)]['数量(箱)'].sum())
-                    year_boxes = float(out_base[out_base['年份'] == oy]['数量(箱)'].sum())
-                    c1, c2, c3 = st.columns(3)
-                    with c1:
-                        _kpi_card("🚚", f"本日出库（{om}月{od}日）", f"{fmt_num(today_boxes)} 箱", [])
-                    with c2:
-                        _kpi_card("📦", f"本月累计出库（{om}月）", f"{fmt_num(month_boxes)} 箱", [])
-                    with c3:
-                        _kpi_card("🧾", f"本年累计出库（{oy}年）", f"{fmt_num(year_boxes)} 箱", [])
-                else:
-                    st.info("出库数据为空或缺少日期/数量字段")
+                st.markdown("---")
 
-                st.markdown("### 📱 扫码率概览")
-                df_scan = _filter_common(df_scan_raw)
-                if not df_scan.empty and not out_base.empty:
-                    for c in ['年份', '月份', '日']:
-                        if c in df_scan.columns:
-                            df_scan[c] = pd.to_numeric(df_scan[c], errors='coerce').fillna(0).astype(int)
-                    oy = int(out_base['年份'].max())
-                    om = int(out_base[out_base['年份'] == oy]['月份'].max())
-                    od = int(out_base[(out_base['年份'] == oy) & (out_base['月份'] == om)]['日'].max())
-                    scan_today = len(df_scan[(df_scan['年份'] == oy) & (df_scan['月份'] == om) & (df_scan['日'] == od)]) / 6.0
-                    scan_month = len(df_scan[(df_scan['年份'] == oy) & (df_scan['月份'] == om)]) / 6.0
-                    scan_year = len(df_scan[df_scan['年份'] == oy]) / 6.0
-                    today_boxes = float(out_base[(out_base['年份'] == oy) & (out_base['月份'] == om) & (out_base['日'] == od)]['数量(箱)'].sum())
-                    month_boxes = float(out_base[(out_base['年份'] == oy) & (out_base['月份'] == om)]['数量(箱)'].sum())
-                    year_boxes = float(out_base[out_base['年份'] == oy]['数量(箱)'].sum())
-                    rate_today = scan_today / today_boxes if today_boxes > 0 else 0
-                    rate_month = scan_month / month_boxes if month_boxes > 0 else 0
-                    rate_year = scan_year / year_boxes if year_boxes > 0 else 0
-                    c1, c2, c3 = st.columns(3)
-                    with c1:
-                        _kpi_card("📱", "本日扫码率", fmt_pct_ratio(rate_today), [
-                            ("扫码(箱)", fmt_num(scan_today)),
-                            ("出库(箱)", fmt_num(today_boxes)),
-                        ])
-                    with c2:
-                        _kpi_card("🗓️", "本月扫码率", fmt_pct_ratio(rate_month), [
-                            ("扫码(箱)", fmt_num(scan_month)),
-                            ("出库(箱)", fmt_num(month_boxes)),
-                        ])
-                    with c3:
-                        _kpi_card("📈", "本年扫码率", fmt_pct_ratio(rate_year), [
-                            ("扫码(箱)", fmt_num(scan_year)),
-                            ("出库(箱)", fmt_num(year_boxes)),
-                        ])
-                else:
-                    st.info("扫码或出库数据为空，无法计算扫码率概览")
-
+                # ---------------------------------------------------------
+                # 2. 库存关键指标 (From Tab 6)
+                # ---------------------------------------------------------
                 st.markdown("### 📦 库存关键指标")
                 df_stock = _filter_common(df_stock_raw)
                 if not df_stock.empty:
+                    # Prepare Data for Metrics
                     stock_box_col = '箱数' if '箱数' in df_stock.columns else next((c for c in df_stock.columns if '箱' in str(c)), None)
                     stock_boxes = float(pd.to_numeric(df_stock[stock_box_col], errors='coerce').fillna(0).sum()) if stock_box_col else 0.0
-                    dist_n = len(set(df_stock['经销商名称'].tolist())) if '经销商名称' in df_stock.columns else 0
-                    sku_col = '产品编码' if '产品编码' in df_stock.columns else ('产品名称' if '产品名称' in df_stock.columns else None)
-                    sku_n = len(set(df_stock[sku_col].tolist())) if sku_col else 0
-                    c1, c2, c3 = st.columns(3)
-                    with c1:
-                        _kpi_card("📦", "总库存(箱)", f"{fmt_num(stock_boxes)} 箱", [])
-                    with c2:
-                        _kpi_card("🏷️", "经销商数", f"{fmt_num(dist_n)}", [])
-                    with c3:
-                        _kpi_card("🧩", "SKU数", f"{fmt_num(sku_n)}", [])
+                    
+                    # Q4 Avg Sales (Need logic from Tab 6)
+                    total_q4_avg = 0.0
+                    if df_q4_raw is not None and not getattr(df_q4_raw, "empty", True):
+                        # Simple estimation: Filter Q4 raw by current filters -> Sum Q4 months -> Divide by 3
+                        # Tab 6 logic is more complex (Distributor based), but for Overview Total, simple sum is close enough.
+                        # However, let's try to match Tab 6 logic: Sum 'Q4_Avg' of relevant distributors.
+                        
+                        # 1. Get filtered distributors
+                        valid_dists = df_stock['经销商名称'].unique()
+                        
+                        # 2. Calculate Q4 Sales for these distributors
+                        df_q4_f = df_q4_raw.copy()
+                        if '年份' in df_q4_f.columns: df_q4_f = df_q4_f[df_q4_f['年份'] == 2025] # Q4 assumption
+                        if '经销商名称' in df_q4_f.columns:
+                            df_q4_f = df_q4_f[df_q4_f['经销商名称'].isin(valid_dists)]
+                        
+                        # Filter for Oct, Nov, Dec
+                        if '月份' in df_q4_f.columns:
+                            df_q4_f['月份'] = pd.to_numeric(df_q4_f['月份'], errors='coerce').fillna(0).astype(int)
+                            df_q4_f = df_q4_f[df_q4_f['月份'].isin([10, 11, 12])]
+                        
+                        qty_col = '数量(箱)' if '数量(箱)' in df_q4_f.columns else next((c for c in df_q4_f.columns if '数量' in str(c)), None)
+                        if qty_col:
+                            total_q4_sales = pd.to_numeric(df_q4_f[qty_col], errors='coerce').sum()
+                            total_q4_avg = total_q4_sales / 3.0
+
+                    dos = stock_boxes / total_q4_avg if total_q4_avg > 0 else 0.0
+                    
+                    # Abnormal Count (Simplify for Overview)
+                    # Tab 6 calculates per distributor. Here we just show global metrics.
+                    
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("📦 总库存 (箱)", fmt_num(stock_boxes))
+                    m2.metric("📉 Q4月均销", fmt_num(total_q4_avg))
+                    m3.metric("📅 整体可销月 (DOS)", fmt_num(dos))
                 else:
-                    st.info("库存数据为空或缺少箱数字段")
+                    st.info("库存数据为空")
+
+                st.markdown("---")
+
+                # ---------------------------------------------------------
+                # 3. 出库关键指标 (From Tab Out)
+                # ---------------------------------------------------------
+                st.markdown("### 🚚 出库关键指标")
+                df_out = _filter_common(df_q4_raw)
+                if not df_out.empty:
+                    # Date Prep
+                    tmp = df_out.copy()
+                    for c in ['年份', '月份']: 
+                        if c in tmp.columns: tmp[c] = pd.to_numeric(tmp[c], errors='coerce').fillna(0).astype(int)
+                    if '日' in tmp.columns: tmp['日'] = pd.to_numeric(tmp['日'], errors='coerce').fillna(0).astype(int)
+                    qty_col = '数量(箱)' if '数量(箱)' in tmp.columns else next((c for c in tmp.columns if '数量' in str(c) or '箱' in str(c)), None)
+                    if qty_col:
+                        tmp['数量(箱)'] = pd.to_numeric(tmp[qty_col], errors='coerce').fillna(0)
+                        tmp = tmp[tmp['年份'] > 0]
+                        
+                        oy = int(tmp['年份'].max())
+                        om = int(tmp[tmp['年份'] == oy]['月份'].max())
+                        od = int(tmp[(tmp['年份'] == oy) & (tmp['月份'] == om)]['日'].max())
+                        
+                        # Current
+                        today_boxes = tmp[(tmp['年份'] == oy) & (tmp['月份'] == om) & (tmp['日'] == od)]['数量(箱)'].sum()
+                        month_boxes = tmp[(tmp['年份'] == oy) & (tmp['月份'] == om)]['数量(箱)'].sum()
+                        year_boxes = tmp[tmp['年份'] == oy]['数量(箱)'].sum()
+                        
+                        # Last Year
+                        ly = oy - 1
+                        l_today_boxes = tmp[(tmp['年份'] == ly) & (tmp['月份'] == om) & (tmp['日'] == od)]['数量(箱)'].sum()
+                        l_month_boxes = tmp[(tmp['年份'] == ly) & (tmp['月份'] == om)]['数量(箱)'].sum()
+                        l_year_boxes = tmp[tmp['年份'] == ly]['数量(箱)'].sum()
+                        
+                        # YoY
+                        yoy_d = (today_boxes - l_today_boxes) / l_today_boxes if l_today_boxes > 0 else 0
+                        yoy_m = (month_boxes - l_month_boxes) / l_month_boxes if l_month_boxes > 0 else 0
+                        yoy_y = (year_boxes - l_year_boxes) / l_year_boxes if l_year_boxes > 0 else 0
+                        
+                        k1, k2, k3 = st.columns(3)
+                        with k1:
+                            trend = _trend_cls(yoy_d)
+                            arr = _arrow(yoy_d)
+                            _render_general_card("本日出库", "🚚", f"{fmt_num(today_boxes)} 箱", [
+                                ("同期", f"{fmt_num(l_today_boxes)} 箱"),
+                                ("同比", f'<span class="{trend}">{arr} {_fmt_pct(yoy_d)}</span>')
+                            ])
+                        with k2:
+                            trend = _trend_cls(yoy_m)
+                            arr = _arrow(yoy_m)
+                            _render_general_card(f"本月累计出库（{om}月）", "📦", f"{fmt_num(month_boxes)} 箱", [
+                                ("同期", f"{fmt_num(l_month_boxes)} 箱"),
+                                ("同比", f'<span class="{trend}">{arr} {_fmt_pct(yoy_m)}</span>')
+                            ])
+                        with k3:
+                            trend = _trend_cls(yoy_y)
+                            arr = _arrow(yoy_y)
+                            _render_general_card(f"本年累计出库（{oy}年）", "🧾", f"{fmt_num(year_boxes)} 箱", [
+                                ("同期", f"{fmt_num(l_year_boxes)} 箱"),
+                                ("同比", f'<span class="{trend}">{arr} {_fmt_pct(yoy_y)}</span>')
+                            ])
+                else:
+                    st.info("出库数据为空")
+
+                st.markdown("---")
+
+                # ---------------------------------------------------------
+                # 4. 扫码率概览 (From Tab Scan)
+                # ---------------------------------------------------------
+                st.markdown("### 📱 扫码率概览")
+                df_scan = _filter_common(df_scan_raw)
+                # Re-use out_base from above or re-calc
+                if not df_scan.empty and not df_out.empty:
+                    # Ensure Date Cols
+                    for c in ['年份', '月份', '日']:
+                        if c in df_scan.columns: df_scan[c] = pd.to_numeric(df_scan[c], errors='coerce').fillna(0).astype(int)
+                    
+                    # Use same oy, om, od from Outbound
+                    scan_today = len(df_scan[(df_scan['年份'] == oy) & (df_scan['月份'] == om) & (df_scan['日'] == od)]) / 6.0
+                    scan_month = len(df_scan[(df_scan['年份'] == oy) & (df_scan['月份'] == om)]) / 6.0
+                    scan_year = len(df_scan[df_scan['年份'] == oy]) / 6.0
+                    
+                    l_scan_today = len(df_scan[(df_scan['年份'] == ly) & (df_scan['月份'] == om) & (df_scan['日'] == od)]) / 6.0
+                    l_scan_month = len(df_scan[(df_scan['年份'] == ly) & (df_scan['月份'] == om)]) / 6.0
+                    l_scan_year = len(df_scan[df_scan['年份'] == ly]) / 6.0
+
+                    rate_today = scan_today / today_boxes if today_boxes > 0 else 0
+                    rate_month = scan_month / month_boxes if month_boxes > 0 else 0
+                    rate_year = scan_year / year_boxes if year_boxes > 0 else 0
+                    
+                    yoy_rate_d = rate_today - (l_scan_today / l_today_boxes if l_today_boxes > 0 else 0)
+                    yoy_rate_m = rate_month - (l_scan_month / l_month_boxes if l_month_boxes > 0 else 0)
+                    yoy_rate_y = rate_year - (l_scan_year / l_year_boxes if l_year_boxes > 0 else 0)
+
+                    s1, s2, s3 = st.columns(3)
+                    with s1:
+                        trend = _trend_cls(yoy_rate_d)
+                        arr = _arrow(yoy_rate_d)
+                        _render_general_card("本日扫码率", "📱", fmt_pct_ratio(rate_today), [
+                            ("扫码 / 出库", f"{fmt_num(scan_today)} / {fmt_num(today_boxes)}"),
+                            ("同比增减", f'<span class="{trend}">{arr} {fmt_pct_value(yoy_rate_d*100)}</span>')
+                        ])
+                    with s2:
+                        trend = _trend_cls(yoy_rate_m)
+                        arr = _arrow(yoy_rate_m)
+                        _render_general_card("本月扫码率", "🗓️", fmt_pct_ratio(rate_month), [
+                            ("扫码 / 出库", f"{fmt_num(scan_month)} / {fmt_num(month_boxes)}"),
+                            ("同比增减", f'<span class="{trend}">{arr} {fmt_pct_value(yoy_rate_m*100)}</span>')
+                        ])
+                    with s3:
+                        trend = _trend_cls(yoy_rate_y)
+                        arr = _arrow(yoy_rate_y)
+                        _render_general_card("本年扫码率", "📈", fmt_pct_ratio(rate_year), [
+                            ("扫码 / 出库", f"{fmt_num(scan_year)} / {fmt_num(year_boxes)}"),
+                            ("同比增减", f'<span class="{trend}">{arr} {fmt_pct_value(yoy_rate_y*100)}</span>')
+                        ])
+                else:
+                    st.info("扫码数据为空")
 
             # === TAB SCAN: SCAN ANALYSIS ===
             with tab_scan:
@@ -3261,7 +3383,14 @@ if uploaded_file:
 
                         cat_col = '类目' if '类目' in df_perf.columns else ('大类' if '大类' in df_perf.columns else None)
                         cat_opts = sorted([x for x in df_perf.get(cat_col, pd.Series(dtype=str)).dropna().astype(str).str.strip().unique().tolist() if x]) if cat_col else []
-                        cat_sel = st.multiselect("类目（多选）", cat_opts, default=cat_opts if not st.session_state.perf_cats else st.session_state.perf_cats, key="perf_cats")
+                        
+                        default_cats = []
+                        if st.session_state.perf_cats:
+                            default_cats = [c for c in st.session_state.perf_cats if c in cat_opts]
+                        else:
+                            default_cats = cat_opts
+                            
+                        cat_sel = st.multiselect("类目（多选）", cat_opts, default=default_cats, key="perf_cats")
 
                         dist_opts = sorted([x for x in df_perf.get('经销商名称', pd.Series(dtype=str)).dropna().astype(str).str.strip().unique().tolist() if x])
                         dist_sel = st.multiselect("经销商（可选）", dist_opts, default=[], key="perf_dists")
