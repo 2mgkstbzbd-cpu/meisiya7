@@ -1948,14 +1948,26 @@ def load_data_v3(file_bytes: bytes, file_name: str):
 @st.cache_data(ttl=3600)
 def load_builtin_perf_2025():
     base_dir = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
-    split_files = sorted([f for f in os.listdir(base_dir) if f.startswith("perf_2025_part") and f.endswith(".csv")])
+    candidate_dirs = [base_dir, os.path.join(base_dir, "builtin_data")]
+    split_paths_by_dir = {}
+    for d in candidate_dirs:
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if f.startswith("perf_2025_part") and (f.endswith(".csv") or f.endswith(".csv.gz")):
+                    split_paths_by_dir.setdefault(d, []).append(os.path.join(d, f))
+    split_paths = []
+    preferred_dir = os.path.join(base_dir, "builtin_data")
+    if split_paths_by_dir.get(preferred_dir):
+        split_paths = sorted(split_paths_by_dir[preferred_dir])
+    elif split_paths_by_dir.get(base_dir):
+        split_paths = sorted(split_paths_by_dir[base_dir])
 
     df0 = None
-    if split_files:
+    if split_paths:
         try:
             dfs = []
-            for f in split_files:
-                dfs.append(pd.read_csv(os.path.join(base_dir, f)))
+            for p in split_paths:
+                dfs.append(pd.read_csv(p))
             if dfs:
                 df0 = pd.concat(dfs, ignore_index=True)
         except Exception:
@@ -2026,14 +2038,26 @@ def load_builtin_perf_2025():
 @st.cache_data(ttl=3600)
 def load_builtin_scan_2025():
     base_dir = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
-    split_files = sorted([f for f in os.listdir(base_dir) if f.startswith("scan_2025_part") and f.endswith(".csv")])
+    candidate_dirs = [base_dir, os.path.join(base_dir, "builtin_data")]
+    split_paths_by_dir = {}
+    for d in candidate_dirs:
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if f.startswith("scan_2025_part") and (f.endswith(".csv") or f.endswith(".csv.gz")):
+                    split_paths_by_dir.setdefault(d, []).append(os.path.join(d, f))
+    split_paths = []
+    preferred_dir = os.path.join(base_dir, "builtin_data")
+    if split_paths_by_dir.get(preferred_dir):
+        split_paths = sorted(split_paths_by_dir[preferred_dir])
+    elif split_paths_by_dir.get(base_dir):
+        split_paths = sorted(split_paths_by_dir[base_dir])
 
     df0 = None
-    if split_files:
+    if split_paths:
         try:
             dfs = []
-            for f in split_files:
-                dfs.append(pd.read_csv(os.path.join(base_dir, f)))
+            for p in split_paths:
+                dfs.append(pd.read_csv(p))
             if dfs:
                 df0 = pd.concat(dfs, ignore_index=True)
         except Exception:
