@@ -1991,49 +1991,54 @@ def load_builtin_perf_2025():
 
 @st.cache_data(ttl=3600)
 def load_builtin_scan_2025():
+    # Attempt to load built-in file if it exists, otherwise return empty
     base_dir = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
     path = os.path.join(base_dir, "分析底表0115.xlsx")
     if not os.path.exists(path):
         return pd.DataFrame()
-    xl = pd.ExcelFile(path)
-    if len(xl.sheet_names) <= 5:
+    
+    try:
+        xl = pd.ExcelFile(path)
+        if len(xl.sheet_names) <= 5:
+            return pd.DataFrame()
+
+        df0 = xl.parse(5)
+        if df0 is None or df0.empty:
+            return pd.DataFrame()
+
+        def _col(idx: int):
+            if idx < df0.shape[1]:
+                return df0.iloc[:, idx]
+            return pd.Series([None] * len(df0))
+
+        df = pd.DataFrame({
+            "门店名称": _col(1),
+            "经销商名称": _col(18),
+            "省区": _col(17),
+            "产品大类": _col(19),
+            "产品小类": _col(20),
+            "经纬度": _col(12),
+            "年份": _col(13),
+            "月份": _col(14),
+            "日": _col(15),
+        })
+
+        df["年份"] = df["年份"].astype(str).str.extract(r"(\d+)")[0].astype(float).fillna(0).astype(int)
+        df["年份"] = df["年份"].apply(lambda y: y + 2000 if 0 < y < 100 else y)
+        df["月份"] = df["月份"].astype(str).str.extract(r"(\d+)")[0].astype(float).fillna(0).astype(int)
+        df["日"] = df["日"].astype(str).str.extract(r"(\d+)")[0].astype(float).fillna(0).astype(int)
+
+        for c in ["门店名称", "省区", "经销商名称", "产品大类", "产品小类"]:
+            df[c] = df[c].fillna("").astype(str).str.strip()
+
+        coords = df["经纬度"].apply(_parse_lon_lat)
+        df["经度"] = coords.apply(lambda x: x[0])
+        df["纬度"] = coords.apply(lambda x: x[1])
+
+        df = df[df["年份"] == 2025]
+        return df
+    except Exception:
         return pd.DataFrame()
-
-    df0 = xl.parse(5)
-    if df0 is None or df0.empty:
-        return pd.DataFrame()
-
-    def _col(idx: int):
-        if idx < df0.shape[1]:
-            return df0.iloc[:, idx]
-        return pd.Series([None] * len(df0))
-
-    df = pd.DataFrame({
-        "门店名称": _col(1),
-        "经销商名称": _col(18),
-        "省区": _col(17),
-        "产品大类": _col(19),
-        "产品小类": _col(20),
-        "经纬度": _col(12),
-        "年份": _col(13),
-        "月份": _col(14),
-        "日": _col(15),
-    })
-
-    df["年份"] = df["年份"].astype(str).str.extract(r"(\d+)")[0].astype(float).fillna(0).astype(int)
-    df["年份"] = df["年份"].apply(lambda y: y + 2000 if 0 < y < 100 else y)
-    df["月份"] = df["月份"].astype(str).str.extract(r"(\d+)")[0].astype(float).fillna(0).astype(int)
-    df["日"] = df["日"].astype(str).str.extract(r"(\d+)")[0].astype(float).fillna(0).astype(int)
-
-    for c in ["门店名称", "省区", "经销商名称", "产品大类", "产品小类"]:
-        df[c] = df[c].fillna("").astype(str).str.strip()
-
-    coords = df["经纬度"].apply(_parse_lon_lat)
-    df["经度"] = coords.apply(lambda x: x[0])
-    df["纬度"] = coords.apply(lambda x: x[1])
-
-    df = df[df["年份"] == 2025]
-    return df
 
 # -----------------------------------------------------------------------------
 # 4. Layout
@@ -2078,7 +2083,7 @@ if uploaded_file is None:
         """,
         unsafe_allow_html=True
     )
-    st.stop()
+    # st.stop()  # Streamlit Cloud Health Check Fix: Avoid blocking the app here
 
 # Main Logic
 if uploaded_file:
@@ -2188,7 +2193,7 @@ if uploaded_file:
             st.markdown(f"当前数据范围: **{sel_prov}** / **{sel_dist}** | 包含 **{len(df)}** 家门店")
             
             # --- Tabs ---
-            tab1, tab7, tab6, tab_out, tab_scan, tab3, tab_other = st.tabs(["📊 核心概览", "🚀 业绩分析", "📦 库存分析", "🚚 出库分析", "📱 扫码分析", "📈 ABCD效能分析", "其他分析"], key="main_tabs_group")
+            tab1, tab7, tab6, tab_out, tab_scan, tab3, tab_other = st.tabs(["📊 核心概览", "🚀 业绩分析", "📦 库存分析", "🚚 出库分析", "📱 扫码分析", "📈 ABCD效能分析", "其他分析"])
             
             # === TAB 1: OVERVIEW ===
             with tab1:
@@ -2524,7 +2529,7 @@ if uploaded_file:
                     rate_day = (scan_day / out_day) if out_day > 0 else 0
                     rate_day_last = (scan_day_last / out_day_last) if out_day_last > 0 else 0
 
-                    tab_overview, tab_s_cat, tab_s_prov, tab_s_map = st.tabs(["📊 扫码率概览", "🧩 分品类扫码率", "🗺️ 省区扫码率", "🧭 地图热力"], key="scan_sub_tabs_group")
+                    tab_overview, tab_s_cat, tab_s_prov, tab_s_map = st.tabs(["📊 扫码率概览", "🧩 分品类扫码率", "🗺️ 省区扫码率", "🧭 地图热力"])
 
                     with tab_overview:
                         st.caption(f"口径：今日 {cur_year}年{cur_month}月{cur_day}日｜本月 {cur_month}月｜本年 {cur_year}年")
