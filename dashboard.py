@@ -1948,16 +1948,34 @@ def load_data_v3(file_bytes: bytes, file_name: str):
 @st.cache_data(ttl=3600)
 def load_builtin_perf_2025():
     base_dir = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
-    path = os.path.join(base_dir, "分析底表0115.xlsx")
-    if not os.path.exists(path):
-        return pd.DataFrame()
-    xl = pd.ExcelFile(path)
-    sheet_name = next((s for s in xl.sheet_names if "发货" in str(s)), None)
-    if sheet_name is None and len(xl.sheet_names) > 3:
-        sheet_name = xl.sheet_names[3]
-    if sheet_name is None:
-        return pd.DataFrame()
-    df0 = xl.parse(sheet_name)
+    split_files = sorted([f for f in os.listdir(base_dir) if f.startswith("perf_2025_part") and f.endswith(".csv")])
+
+    df0 = None
+    if split_files:
+        try:
+            dfs = []
+            for f in split_files:
+                dfs.append(pd.read_csv(os.path.join(base_dir, f)))
+            if dfs:
+                df0 = pd.concat(dfs, ignore_index=True)
+        except Exception:
+            df0 = None
+
+    if df0 is None:
+        path = os.path.join(base_dir, "分析底表0115.xlsx")
+        if not os.path.exists(path):
+            return pd.DataFrame()
+        try:
+            xl = pd.ExcelFile(path)
+            sheet_name = next((s for s in xl.sheet_names if "发货" in str(s)), None)
+            if sheet_name is None and len(xl.sheet_names) > 3:
+                sheet_name = xl.sheet_names[3]
+            if sheet_name is None:
+                return pd.DataFrame()
+            df0 = xl.parse(sheet_name)
+        except Exception:
+            return pd.DataFrame()
+
     df0.columns = [str(c).strip() for c in df0.columns]
     col_year = next((c for c in df0.columns if str(c).strip() == "年份" or "年" in str(c)), None)
     col_month = next((c for c in df0.columns if str(c).strip() == "月份" or "月" in str(c)), None)
@@ -2007,54 +2025,66 @@ def load_builtin_perf_2025():
 
 @st.cache_data(ttl=3600)
 def load_builtin_scan_2025():
-    # Attempt to load built-in file if it exists, otherwise return empty
     base_dir = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
-    path = os.path.join(base_dir, "分析底表0115.xlsx")
-    if not os.path.exists(path):
-        return pd.DataFrame()
-    
-    try:
-        xl = pd.ExcelFile(path)
-        if len(xl.sheet_names) <= 5:
+    split_files = sorted([f for f in os.listdir(base_dir) if f.startswith("scan_2025_part") and f.endswith(".csv")])
+
+    df0 = None
+    if split_files:
+        try:
+            dfs = []
+            for f in split_files:
+                dfs.append(pd.read_csv(os.path.join(base_dir, f)))
+            if dfs:
+                df0 = pd.concat(dfs, ignore_index=True)
+        except Exception:
+            df0 = None
+
+    if df0 is None:
+        path = os.path.join(base_dir, "分析底表0115.xlsx")
+        if not os.path.exists(path):
+            return pd.DataFrame()
+        try:
+            xl = pd.ExcelFile(path)
+            if len(xl.sheet_names) <= 5:
+                return pd.DataFrame()
+            df0 = xl.parse(5)
+        except Exception:
             return pd.DataFrame()
 
-        df0 = xl.parse(5)
-        if df0 is None or df0.empty:
-            return pd.DataFrame()
-
-        def _col(idx: int):
-            if idx < df0.shape[1]:
-                return df0.iloc[:, idx]
-            return pd.Series([None] * len(df0))
-
-        df = pd.DataFrame({
-            "门店名称": _col(1),
-            "经销商名称": _col(18),
-            "省区": _col(17),
-            "产品大类": _col(19),
-            "产品小类": _col(20),
-            "经纬度": _col(12),
-            "年份": _col(13),
-            "月份": _col(14),
-            "日": _col(15),
-        })
-
-        df["年份"] = df["年份"].astype(str).str.extract(r"(\d+)")[0].astype(float).fillna(0).astype(int)
-        df["年份"] = df["年份"].apply(lambda y: y + 2000 if 0 < y < 100 else y)
-        df["月份"] = df["月份"].astype(str).str.extract(r"(\d+)")[0].astype(float).fillna(0).astype(int)
-        df["日"] = df["日"].astype(str).str.extract(r"(\d+)")[0].astype(float).fillna(0).astype(int)
-
-        for c in ["门店名称", "省区", "经销商名称", "产品大类", "产品小类"]:
-            df[c] = df[c].fillna("").astype(str).str.strip()
-
-        coords = df["经纬度"].apply(_parse_lon_lat)
-        df["经度"] = coords.apply(lambda x: x[0])
-        df["纬度"] = coords.apply(lambda x: x[1])
-
-        df = df[df["年份"] == 2025]
-        return df
-    except Exception:
+    if df0 is None or df0.empty:
         return pd.DataFrame()
+
+    def _col(idx: int):
+        if idx < df0.shape[1]:
+            return df0.iloc[:, idx]
+        return pd.Series([None] * len(df0))
+
+    df = pd.DataFrame({
+        "门店名称": _col(1),
+        "经销商名称": _col(18),
+        "省区": _col(17),
+        "产品大类": _col(19),
+        "产品小类": _col(20),
+        "经纬度": _col(12),
+        "年份": _col(13),
+        "月份": _col(14),
+        "日": _col(15),
+    })
+
+    df["年份"] = df["年份"].astype(str).str.extract(r"(\d+)")[0].astype(float).fillna(0).astype(int)
+    df["年份"] = df["年份"].apply(lambda y: y + 2000 if 0 < y < 100 else y)
+    df["月份"] = df["月份"].astype(str).str.extract(r"(\d+)")[0].astype(float).fillna(0).astype(int)
+    df["日"] = df["日"].astype(str).str.extract(r"(\d+)")[0].astype(float).fillna(0).astype(int)
+
+    for c in ["门店名称", "省区", "经销商名称", "产品大类", "产品小类"]:
+        df[c] = df[c].fillna("").astype(str).str.strip()
+
+    coords = df["经纬度"].apply(_parse_lon_lat)
+    df["经度"] = coords.apply(lambda x: x[0])
+    df["纬度"] = coords.apply(lambda x: x[1])
+
+    df = df[df["年份"] == 2025]
+    return df
 
 # -----------------------------------------------------------------------------
 # 4. Layout
@@ -2143,7 +2173,14 @@ if uploaded_file:
         if df_perf_raw is None or getattr(df_perf_raw, "empty", True):
             df_perf_raw = df_perf_2025.copy()
         else:
-            years = pd.to_numeric(df_perf_raw.get("年份", pd.Series(dtype=float)), errors="coerce")
+            # Ensure Year type consistency
+            if "年份" in df_perf_raw.columns:
+                df_perf_raw["年份"] = pd.to_numeric(df_perf_raw["年份"], errors="coerce")
+            if "年份" in df_perf_2025.columns:
+                df_perf_2025["年份"] = pd.to_numeric(df_perf_2025["年份"], errors="coerce")
+                
+            years = df_perf_raw.get("年份", pd.Series(dtype=float))
+            # Only append if 2025 is NOT already in the uploaded file
             if not bool((years == 2025).any()):
                 df_perf_raw = pd.concat([df_perf_2025, df_perf_raw], ignore_index=True, sort=False)
                 
@@ -2152,7 +2189,14 @@ if uploaded_file:
         if df_scan_raw is None or getattr(df_scan_raw, "empty", True):
             df_scan_raw = df_scan_2025.copy()
         else:
-            years_s = pd.to_numeric(df_scan_raw.get("年份", pd.Series(dtype=float)), errors="coerce")
+            # Ensure Year type consistency
+            if "年份" in df_scan_raw.columns:
+                df_scan_raw["年份"] = pd.to_numeric(df_scan_raw["年份"], errors="coerce")
+            if "年份" in df_scan_2025.columns:
+                df_scan_2025["年份"] = pd.to_numeric(df_scan_2025["年份"], errors="coerce")
+                
+            years_s = df_scan_raw.get("年份", pd.Series(dtype=float))
+            # Only append if 2025 is NOT already in the uploaded file
             if not bool((years_s == 2025).any()):
                 df_scan_raw = pd.concat([df_scan_2025, df_scan_raw], ignore_index=True, sort=False)
 
