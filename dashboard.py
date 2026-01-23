@@ -93,8 +93,17 @@ st.set_page_config(
 st.markdown('<meta name="google" content="notranslate" />', unsafe_allow_html=True)
 st.markdown("""
 <script>
+  // Force disable translation
   document.documentElement.setAttribute("translate", "no");
-  document.querySelector('html').setAttribute("translate", "no");
+  document.documentElement.classList.add("notranslate");
+  document.body.setAttribute("translate", "no");
+  document.body.classList.add("notranslate");
+  
+  // Inject meta tag to head
+  var meta = document.createElement('meta');
+  meta.name = "google";
+  meta.content = "notranslate";
+  document.getElementsByTagName('head')[0].appendChild(meta);
 </script>
 """, unsafe_allow_html=True)
 
