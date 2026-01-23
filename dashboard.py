@@ -90,6 +90,13 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed"
 )
+st.markdown('<meta name="google" content="notranslate" />', unsafe_allow_html=True)
+st.markdown("""
+<script>
+  document.documentElement.setAttribute("translate", "no");
+  document.querySelector('html').setAttribute("translate", "no");
+</script>
+""", unsafe_allow_html=True)
 
 _required_password = os.getenv("DASHBOARD_PASSWORD", "").strip()
 if _required_password:
