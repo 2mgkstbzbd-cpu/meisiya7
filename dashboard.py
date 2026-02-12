@@ -9,8 +9,11 @@ import os
 import socket
 import hashlib
 import re
+import json
+import zipfile
 from datetime import datetime
 import html as _html
+from PIL import Image, ImageDraw, ImageFont
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, JsCode
 def _is_nan(x):
     try:
@@ -28,6 +31,22 @@ def fmt_num(x, na="—"):
     s = s.rstrip("0").rstrip(".")
     return s
 
+def fmt_num_fixed(x, decimals: int = 1, na: str = "—"):
+    if x is None or _is_nan(x):
+        return na
+    try:
+        return f"{float(x):,.{int(decimals)}f}"
+    except Exception:
+        return str(x)
+
+def sanitize_filename(name: str, default: str = "export"):
+    s = str(name or "").strip()
+    if not s:
+        s = default
+    s = re.sub(r"[\\\\/:*?\"<>|]+", "_", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:120] if len(s) > 120 else s
+
 def fmt_pct_ratio(r, na="—", decimals=1):
     if r is None or _is_nan(r):
         return na
@@ -42,6 +61,200 @@ def fmt_pct_value(p, na="—", decimals=1):
     sign = "+" if v > 0 else ("-" if v < 0 else "")
     s = f"{abs(v):.{decimals}f}".rstrip("0").rstrip(".")
     return f"{sign}{s}%"
+
+def _pil_load_font(size: int, bold: bool = False):
+    candidates = [
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\msyhbd.ttc",
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\simsun.ttc",
+        r"C:\Windows\Fonts\arial.ttf",
+    ]
+    if bold:
+        bold_first = [r"C:\Windows\Fonts\msyhbd.ttc", r"C:\Windows\Fonts\arialbd.ttf"]
+        candidates = bold_first + [c for c in candidates if c not in bold_first]
+    for p in candidates:
+        try:
+            return ImageFont.truetype(p, size=size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+def _pil_table_png(df: pd.DataFrame, title_lines: list[str], font_size: int = 16, col_types: dict | None = None):
+    d = df.copy().fillna("")
+    font = _pil_load_font(font_size, bold=False)
+    font_b = _pil_load_font(font_size + 2, bold=True)
+    pad_x = 14
+    pad_y = 10
+    grid_color = (220, 223, 230)
+    text_color = (31, 35, 40)
+    header_bg = (245, 247, 250)
+    title_bg = (255, 255, 255)
+    row_bg_odd = (255, 255, 255)
+    row_bg_even = (252, 253, 255)
+
+    headers = d.columns.tolist()
+    rows = d.values.tolist()
+    n_rows = len(rows)
+    n_cols = len(headers)
+    col_types = col_types or {}
+
+    def _text_wh(txt, fnt):
+        if txt is None:
+            return 0, 0
+        s = str(txt)
+        if not s:
+            return 0, 0
+        bbox = fnt.getbbox(s)
+        return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    def _cell_text(v, t):
+        if t == "num":
+            return fmt_num_fixed(v, decimals=1, na="0")
+        if v is None:
+            return ""
+        return str(v)
+
+    fixed_w = {"spark": 160, "tag": 160}
+    col_widths = []
+    for j in range(n_cols):
+        name = headers[j]
+        t = col_types.get(name, "text")
+        if t in fixed_w:
+            col_widths.append(fixed_w[t])
+            continue
+        w0, _ = _text_wh(name, font_b)
+        w = w0
+        for i in range(min(n_rows, 120)):
+            txt = _cell_text(rows[i][j], t)
+            w1, _ = _text_wh(txt, font)
+            if w1 > w:
+                w = w1
+        col_widths.append(int(w + pad_x * 2))
+
+    row_h = max(_text_wh("Ag", font)[1] + pad_y * 2, font_size + pad_y * 2 + 6)
+    header_h = max(_text_wh("Ag", font_b)[1] + pad_y * 2, font_size + pad_y * 2 + 10)
+
+    title_lines = [str(x) for x in title_lines if str(x).strip()]
+    title_h = 0
+    if title_lines:
+        title_h = (row_h * len(title_lines)) + 10
+
+    table_w = int(sum(col_widths) + 1)
+    table_h = int(header_h + (n_rows * row_h) + 1)
+    img_w = table_w
+    img_h = int(title_h + table_h)
+
+    img = Image.new("RGB", (img_w, img_h), title_bg)
+    draw = ImageDraw.Draw(img)
+
+    y = 0
+    if title_lines:
+        draw.rectangle([0, 0, img_w, title_h], fill=title_bg)
+        ty = 6
+        for k, line in enumerate(title_lines):
+            fnt = font_b if k == 0 else font
+            draw.text((pad_x, ty), line, fill=text_color, font=fnt)
+            ty += row_h
+        y = title_h
+
+    x = 0
+    draw.rectangle([0, y, img_w, y + header_h], fill=header_bg)
+    for j in range(n_cols):
+        w = col_widths[j]
+        draw.rectangle([x, y, x + w, y + header_h], outline=grid_color, width=1)
+        txt = headers[j]
+        tw, th = _text_wh(txt, font_b)
+        draw.text((x + (w - tw) / 2, y + (header_h - th) / 2), txt, fill=text_color, font=font_b)
+        x += w
+
+    def _draw_sparkline(cell_box, v):
+        try:
+            vals = json.loads(v) if isinstance(v, str) else list(v)
+        except Exception:
+            vals = []
+        try:
+            vals = [float(x) for x in vals if x is not None]
+        except Exception:
+            vals = []
+        if len(vals) < 2:
+            return
+        left, top, right, bottom = cell_box
+        inner_l = left + pad_x
+        inner_r = right - pad_x
+        inner_t = top + pad_y
+        inner_b = bottom - pad_y
+        if inner_r - inner_l < 10 or inner_b - inner_t < 10:
+            return
+        vmin = min(vals)
+        vmax = max(vals)
+        if vmax == vmin:
+            vmax = vmin + 1.0
+        n = len(vals)
+        pts = []
+        for i, val in enumerate(vals):
+            px = inner_l + (inner_r - inner_l) * (i / (n - 1))
+            py = inner_b - (inner_b - inner_t) * ((val - vmin) / (vmax - vmin))
+            pts.append((px, py))
+        line_color = (255, 112, 0)
+        draw.line(pts, fill=line_color, width=2, joint="curve")
+
+    def _tag_style(tag: str):
+        t = (tag or "").strip()
+        if t == "持续增长":
+            return (219, 246, 229), (15, 81, 50)
+        if t == "持续下滑":
+            return (254, 226, 226), (127, 29, 29)
+        if t == "先下滑后增长":
+            return (219, 234, 254), (30, 64, 175)
+        if t == "先增长后下滑":
+            return (254, 243, 199), (146, 64, 14)
+        return (229, 231, 235), (55, 65, 81)
+
+    def _draw_tag(cell_box, tag: str):
+        left, top, right, bottom = cell_box
+        bg, fg = _tag_style(tag)
+        rect_l = left + pad_x
+        rect_r = right - pad_x
+        rect_t = top + int(pad_y * 0.7)
+        rect_b = bottom - int(pad_y * 0.7)
+        if rect_r - rect_l < 10 or rect_b - rect_t < 10:
+            return
+        try:
+            draw.rounded_rectangle([rect_l, rect_t, rect_r, rect_b], radius=14, fill=bg, outline=grid_color, width=1)
+        except Exception:
+            draw.rectangle([rect_l, rect_t, rect_r, rect_b], fill=bg, outline=grid_color, width=1)
+        txt = (tag or "").strip()
+        tw, th = _text_wh(txt, font)
+        draw.text((rect_l + (rect_r - rect_l - tw) / 2, rect_t + (rect_b - rect_t - th) / 2), txt, fill=fg, font=font)
+
+    for i in range(n_rows):
+        x = 0
+        yy = y + header_h + i * row_h
+        row_bg = row_bg_even if (i % 2 == 1) else row_bg_odd
+        for j in range(n_cols):
+            w = col_widths[j]
+            left = x
+            right = x + w
+            top = yy
+            bottom = yy + row_h
+            draw.rectangle([left, top, right, bottom], fill=row_bg, outline=grid_color, width=1)
+            name = headers[j]
+            t = col_types.get(name, "text")
+            v = rows[i][j]
+            if t == "spark":
+                _draw_sparkline((left, top, right, bottom), v)
+            elif t == "tag":
+                _draw_tag((left, top, right, bottom), str(v))
+            else:
+                txt = _cell_text(v, t)
+                tw, th = _text_wh(txt, font)
+                draw.text((left + (w - tw) / 2, top + (row_h - th) / 2), txt, fill=text_color, font=font)
+            x += w
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 _COORD_NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
 
@@ -699,6 +912,83 @@ class ProgressBarCountRenderer {
                 <div style="width: ${percent}%; height: 100%; background-color: ${color}; border-radius: 3px; transition: width 0.5s;"></div>
                 <span style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; text-align: center; line-height: 20px; font-size: 12px; color: #000;">${fmt1(value)}</span>
             </div>
+        `;
+    }
+    getGui() {
+        return this.eGui;
+    }
+}
+""")
+
+JS_SPARKLINE = JsCode("""
+class SparklineRenderer {
+    init(params) {
+        this.eGui = document.createElement('div');
+        this.eGui.style.width = '100%';
+        this.eGui.style.height = '100%';
+        this.eGui.style.display = 'flex';
+        this.eGui.style.alignItems = 'center';
+        this.eGui.style.justifyContent = 'center';
+
+        let raw = params.value;
+        let arr = [];
+        try {
+            if (Array.isArray(raw)) arr = raw;
+            else if (typeof raw === 'string') arr = JSON.parse(raw);
+            else arr = [];
+        } catch (e) {
+            arr = [];
+        }
+        arr = (arr || []).map(v => Number(v) || 0);
+        const w = (params.colDef && params.colDef.cellRendererParams && params.colDef.cellRendererParams.width) ? params.colDef.cellRendererParams.width : 120;
+        const h = (params.colDef && params.colDef.cellRendererParams && params.colDef.cellRendererParams.height) ? params.colDef.cellRendererParams.height : 28;
+        const pad = 3;
+        const n = arr.length;
+        if (!n) {
+            this.eGui.innerHTML = '';
+            return;
+        }
+        let minV = Math.min(...arr);
+        let maxV = Math.max(...arr);
+        const range = (maxV - minV) || 1;
+        const denom = Math.max(1, n - 1);
+        const pts = arr.map((v, i) => {
+            const x = pad + (i * (w - pad * 2)) / denom;
+            const y = (h - pad) - ((v - minV) / range) * (h - pad * 2);
+            return `${x},${y}`;
+        }).join(' ');
+        this.eGui.innerHTML = `
+            <svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="display:block;">
+                <polyline points="${pts}" fill="none" stroke="#f97316" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"></polyline>
+            </svg>
+        `;
+    }
+    getGui() {
+        return this.eGui;
+    }
+}
+""")
+
+JS_TREND_TAG = JsCode("""
+class TrendTagRenderer {
+    init(params) {
+        this.eGui = document.createElement('div');
+        this.eGui.style.width = '100%';
+        this.eGui.style.height = '100%';
+        this.eGui.style.display = 'flex';
+        this.eGui.style.alignItems = 'center';
+        this.eGui.style.justifyContent = 'center';
+        const v = (params.value === null || params.value === undefined) ? '' : String(params.value);
+        let bg = '#f3f4f6';
+        let fg = '#374151';
+        if (v.indexOf('持续增长') >= 0) { bg = '#dcfce7'; fg = '#166534'; }
+        else if (v.indexOf('持续下滑') >= 0) { bg = '#fee2e2'; fg = '#991b1b'; }
+        else if (v.indexOf('先下滑后增长') >= 0) { bg = '#dbeafe'; fg = '#1d4ed8'; }
+        else if (v.indexOf('先增长后下滑') >= 0) { bg = '#fef9c3'; fg = '#a16207'; }
+        this.eGui.innerHTML = `
+            <span style="display:inline-flex; align-items:center; justify-content:center; padding:2px 10px; border-radius:999px; background:${bg}; color:${fg}; font-size:12px; font-weight:800; border:1px solid rgba(0,0,0,0.06);">
+                ${v || '—'}
+            </span>
         `;
     }
     getGui() {
@@ -2276,11 +2566,17 @@ if uploaded_file:
             st.title("📈 美思雅数据分析系统")
             st.markdown(f"当前数据范围: **{sel_prov}** / **{sel_dist}** | 包含 **{len(df)}** 家门店")
             
-            # --- Tabs ---
-            tab1, tab7, tab6, tab_out, tab_scan, tab3, tab_other = st.tabs(["📊 核心概览", "🚀 业绩分析", "📦 库存分析", "🚚 出库分析", "📱 扫码分析", "📈 ABCD效能分析", "其他分析"])
+            main_tab_options = ["📊 核心概览", "🚀 业绩分析", "📦 库存分析", "🚚 出库分析", "📱 扫码分析", "📈 ABCD效能分析", "其他分析"]
+            main_tab = st.segmented_control(
+                "主导航",
+                options=main_tab_options,
+                default=st.session_state.get("main_nav", "🚚 出库分析") if isinstance(st.session_state.get("main_nav", None), str) else "🚚 出库分析",
+                key="main_nav",
+                label_visibility="collapsed",
+            )
             
             # === TAB 1: OVERVIEW ===
-            with tab1:
+            if main_tab == "📊 核心概览":
                 st.caption(f"筛选口径：省区={sel_prov}｜经销商={sel_dist}｜产品大类={st.session_state.get('main_sel_cat', '全部')}")
 
                 # --- Common Helpers for Tab 1 ---
@@ -2596,7 +2892,7 @@ if uploaded_file:
                     st.info("扫码数据为空")
 
             # === TAB SCAN: SCAN ANALYSIS ===
-            with tab_scan:
+            if main_tab == "📱 扫码分析":
                 if df_scan_raw is not None and not df_scan_raw.empty:
                     st.subheader("📱 扫码分析")
                     
@@ -3235,7 +3531,7 @@ if uploaded_file:
                     st.info("请在Excel中包含第6个Sheet（扫码数据）以查看此分析。")
 
             # === TAB 3: ABCD ANALYSIS ===
-            with tab3:
+            if main_tab == "📈 ABCD效能分析":
                 st.subheader("📊 Q3 vs Q4 门店效能对比分析")
                 
                 # Check for Q3/Q4 columns
@@ -3360,7 +3656,7 @@ if uploaded_file:
                         
                     show_aggrid_table(view_df[['省区', '经销商名称', '门店名称', 'Class_Q3', 'Class_Q4', '变动类型', 'Q3_Avg', 'Q4_Avg']])
 
-            with tab_other:
+            if main_tab == "其他分析":
                 other_rank, other_query, other_detail, other_review_2025 = st.tabs(["🏆 榜单排名", "🔍 查询分析", "📝 数据明细", "📅 2025年复盘"])
                 
                 with other_rank:
@@ -3807,7 +4103,7 @@ if uploaded_file:
 
 
             # --- Tab 6: Inventory Analysis ---
-            with tab6:
+            if main_tab == "📦 库存分析":
                 if df_stock_raw is None:
                     st.warning("⚠️ 未检测到库存数据 (Sheet2)。请确保上传的 Excel 文件包含第二个 Sheet 页，且格式正确。")
                     st.info("数据格式要求：\nSheet2 需包含 A-L 列，顺序为：经销商编码、经销商名称、产品编码、产品名称、库存数量、箱数、省区名称、客户简称、产品大类、产品小类、重量、规格。")
@@ -4463,7 +4759,7 @@ if uploaded_file:
                         show_aggrid_table(sku_view, height=520, key='inv_sku_ag')
                         st.caption("注：因Q4出库数据仅精确到经销商层级，此处仅展示SKU库存明细，不计算单品DOS。")
 
-            with tab_out:
+            if main_tab == "🚚 出库分析":
                 if df_q4_raw is None or df_q4_raw.empty:
                     st.warning("⚠️ 未检测到出库数据 (Sheet3)。请确认Excel包含Sheet3且数据完整。")
                     with st.expander("🛠️ 调试信息", expanded=False):
@@ -4478,6 +4774,21 @@ if uploaded_file:
                         o_raw['产品大类'] = '全部'
                     if '产品小类' not in o_raw.columns:
                         o_raw['产品小类'] = '全部'
+                    for _c in ['省区', '经销商名称', '产品大类', '产品小类']:
+                        if _c in o_raw.columns:
+                            o_raw[_c] = o_raw[_c].fillna('').astype(str).str.strip()
+                    if '经销商名称' in o_raw.columns:
+                        o_raw['经销商名称'] = o_raw['经销商名称'].str.replace(r'\s+', '', regex=True)
+
+                    big_cat_src = '透视' if '透视' in o_raw.columns else (o_raw.columns[19] if len(o_raw.columns) > 19 else None)
+                    small_cat_src = '重量' if '重量' in o_raw.columns else (o_raw.columns[20] if len(o_raw.columns) > 20 else None)
+                    out_prod_src = '出库产品' if '出库产品' in o_raw.columns else (o_raw.columns[8] if len(o_raw.columns) > 8 else None)
+                    o_raw['_模块大类'] = o_raw[big_cat_src] if big_cat_src is not None else '全部'
+                    o_raw['_模块小类'] = o_raw[small_cat_src] if small_cat_src is not None else '全部'
+                    o_raw['_模块出库产品'] = o_raw[out_prod_src] if out_prod_src is not None else '全部'
+                    for _c in ['_模块大类', '_模块小类', '_模块出库产品']:
+                        if _c in o_raw.columns:
+                            o_raw[_c] = o_raw[_c].fillna('').astype(str).str.strip()
 
                     day_col = next((c for c in o_raw.columns if str(c).strip() == '日'), None)
                     if day_col is None:
@@ -4610,6 +4921,10 @@ if uploaded_file:
                     if o_sub != '全部':
                         df_o = df_o[df_o['产品小类'].astype(str) == str(o_sub)]
 
+                    df_o_prov_base = o_raw.copy()
+                    if o_dist != '全部' and '经销商名称' in df_o_prov_base.columns:
+                        df_o_prov_base = df_o_prov_base[df_o_prov_base['经销商名称'].astype(str) == str(o_dist)]
+
                     def _agg_scope(df_scope: pd.DataFrame):
                         boxes = float(df_scope.get('数量(箱)', 0).sum()) if df_scope is not None and not df_scope.empty else 0.0
                         if df_scope is None or df_scope.empty or '_门店名' not in df_scope.columns:
@@ -4650,8 +4965,14 @@ if uploaded_file:
                             return ""
                         return "↑" if x > 0 else ("↓" if x < 0 else "")
 
-                    # === Use Native Tabs for Consistency with Other Modules ===
-                    tab_kpi, tab_cat, tab_prov = st.tabs(["📊 关键指标", "📦 分品类", "🗺️ 分省区"])
+                    out_subtab_options = ["📊 关键指标", "📦 分品类", "🗺️ 分省区", "📈 趋势分析"]
+                    out_subtab = st.segmented_control(
+                        "出库子导航",
+                        options=out_subtab_options,
+                        default=st.session_state.get("out_subtab_nav", "📈 趋势分析") if isinstance(st.session_state.get("out_subtab_nav", None), str) else "📈 趋势分析",
+                        key="out_subtab_nav",
+                        label_visibility="collapsed",
+                    )
                     
                     # Prepare Data Context (Shared)
                     sig = (o_prov, o_dist, o_cat, o_sub, o_year, o_month)
@@ -4711,7 +5032,7 @@ if uploaded_file:
                     )
 
                     # --- Tab 1: KPI ---
-                    with tab_kpi:
+                    if out_subtab == "📊 关键指标":
                         ck = ("kpi", sig)
                         if ck not in st.session_state.out_subtab_cache:
                              t_boxes, t_stores = _agg_scope(ctx["cur_today"])
@@ -4786,7 +5107,7 @@ if uploaded_file:
                             """, unsafe_allow_html=True)
 
                     # --- Tab 2: Category ---
-                    with tab_cat:
+                    if out_subtab == "📦 分品类":
                         ck = ("cat", sig)
                         if ck not in st.session_state.out_subtab_cache:
                             with st.spinner("正在加载分品类…"):
@@ -4860,7 +5181,7 @@ if uploaded_file:
                             show_aggrid_table(cat_tbl, columns_props={'同比': {'type': 'percent'}}, auto_height_limit=520)
 
                     # --- Tab 3: Province ---
-                    with tab_prov:
+                    if out_subtab == "🗺️ 分省区":
 
                         def _prov_agg(df_scope: pd.DataFrame):
                             if df_scope is None or df_scope.empty or '省区' not in df_scope.columns:
@@ -4892,11 +5213,14 @@ if uploaded_file:
                         p_last_month = _prov_agg(ctx["last_month"])
                         p_last_year = _prov_agg(ctx["last_year"])
 
-                        prov_all = sorted(set(
-                            p_cur_today['省区'].astype(str).tolist()
-                            + p_cur_month['省区'].astype(str).tolist()
-                            + p_cur_year['省区'].astype(str).tolist()
-                        ))
+                        if '省区' in df_o_prov_base.columns:
+                            prov_all = sorted([x for x in df_o_prov_base['省区'].dropna().astype(str).unique().tolist() if x and x != 'nan'])
+                        else:
+                            prov_all = sorted(set(
+                                p_cur_today['省区'].astype(str).tolist()
+                                + p_cur_month['省区'].astype(str).tolist()
+                                + p_cur_year['省区'].astype(str).tolist()
+                            ))
                         prov_df = pd.DataFrame({'省区': prov_all})
 
                         def _merge(prov_base, df_left, prefix):
@@ -5050,11 +5374,687 @@ if uploaded_file:
                             theme='streamlit',
                             key="outbound_prov_table"
                         )
+                    
+                    if out_subtab == "📈 趋势分析":
+                        st.markdown("### 📈 月度出库趋势（可选多月）")
+
+                        df_trend_universe = o_raw.copy()
+                        df_trend_base = df_trend_universe.copy()
+                        if df_trend_base is None or df_trend_base.empty:
+                            st.info("暂无可用于月度趋势的数据")
+                        else:
+                            df_trend_base = df_trend_base[df_trend_base["_年"].notna() & df_trend_base["_月"].notna()].copy()
+                            df_trend_base["_年"] = pd.to_numeric(df_trend_base["_年"], errors="coerce").fillna(0).astype(int)
+                            df_trend_base["_月"] = pd.to_numeric(df_trend_base["_月"], errors="coerce").fillna(0).astype(int)
+                            df_trend_base = df_trend_base[(df_trend_base["_年"] > 0) & df_trend_base["_月"].between(1, 12)].copy()
+                            df_trend_base["_ym"] = (df_trend_base["_年"] * 100 + df_trend_base["_月"]).astype(int)
+                            df_trend_base["_ym_label"] = (
+                                df_trend_base["_年"].astype(str).str[-2:]
+                                + "年"
+                                + df_trend_base["_月"].astype(str)
+                                + "月"
+                            )
+
+                            month_map_df = (
+                                df_trend_base[["_ym", "_ym_label"]]
+                                .drop_duplicates()
+                                .sort_values("_ym")
+                                .reset_index(drop=True)
+                            )
+                            ym_to_label = {int(r["_ym"]): str(r["_ym_label"]) for _, r in month_map_df.iterrows()}
+                            label_to_ym = {str(r["_ym_label"]): int(r["_ym"]) for _, r in month_map_df.iterrows()}
+                            month_labels = month_map_df["_ym_label"].astype(str).tolist()
+
+                            default_months = month_labels[-4:] if len(month_labels) >= 4 else month_labels
+                            if st.session_state.get("out_m_month_cols"):
+                                prev = [x for x in st.session_state.out_m_month_cols if x in month_labels]
+                                if prev:
+                                    default_months = prev
+                            c_m1, c_m2, c_m3, c_m4, c_m5 = st.columns([2.0, 1.25, 1.25, 1.4, 0.8])
+                            with c_m1:
+                                sel_labels = st.multiselect(
+                                    "选择月份（可多选）",
+                                    options=month_labels,
+                                    default=default_months,
+                                    key="out_m_sel_months",
+                                )
+                                st.session_state.out_m_month_cols = sel_labels
+
+                            with c_m2:
+                                _s_big = df_trend_universe.get('_模块大类', pd.Series(dtype=str)).dropna().astype(str).str.strip()
+                                cat_big_opts = ['全部'] + sorted([x for x in _s_big.unique().tolist() if x and x.lower() not in ('nan', 'none', 'null')])
+                                sel_big = st.selectbox("产品大类（T列透视）", cat_big_opts, key="out_m_cat_big")
+                            with c_m3:
+                                if '_模块小类' in df_trend_universe.columns:
+                                    if sel_big != '全部' and '_模块大类' in df_trend_universe.columns:
+                                        subs = df_trend_universe[df_trend_universe['_模块大类'].astype(str).str.strip() == str(sel_big).strip()]['_模块小类'].dropna().astype(str).str.strip().unique().tolist()
+                                        cat_small_opts = ['全部'] + sorted([x for x in subs if x and str(x).strip().lower() not in ('nan', 'none', 'null')])
+                                    else:
+                                        _s_small = df_trend_universe['_模块小类'].dropna().astype(str).str.strip()
+                                        cat_small_opts = ['全部'] + sorted([x for x in _s_small.unique().tolist() if x and x.lower() not in ('nan', 'none', 'null')])
+                                else:
+                                    cat_small_opts = ['全部']
+                                sel_small = st.selectbox("产品小类（U列重量）", cat_small_opts, key="out_m_cat_small")
+
+                            with c_m4:
+                                if '_模块出库产品' in df_trend_universe.columns:
+                                    df_prod = df_trend_universe.copy()
+                                    if sel_big != '全部' and '_模块大类' in df_prod.columns:
+                                        df_prod = df_prod[df_prod['_模块大类'].astype(str).str.strip() == str(sel_big).strip()]
+                                    if sel_small != '全部' and '_模块小类' in df_prod.columns:
+                                        df_prod = df_prod[df_prod['_模块小类'].astype(str).str.strip() == str(sel_small).strip()]
+                                    _s_prod = df_prod['_模块出库产品'].dropna().astype(str).str.strip()
+                                    prod_opts = sorted([x for x in _s_prod.unique().tolist() if x and x.lower() not in ('nan', 'none', 'null')])
+                                else:
+                                    prod_opts = []
+                                sel_prod = st.multiselect("出库产品（I列，可多选）", prod_opts, default=[], key="out_m_out_prod")
+
+                            with c_m5:
+                                if st.session_state.get("out_m_drill_level", 1) > 1:
+                                    if st.button("⬅️ 返回", key="out_m_back_btn"):
+                                        if int(st.session_state.out_m_drill_level) == 2:
+                                            st.session_state.out_m_drill_level = 1
+                                            st.session_state.out_m_selected_prov = None
+                                            st.session_state.out_m_selected_dist = None
+                                        else:
+                                            st.session_state.out_m_drill_level = 2
+                                            st.session_state.out_m_selected_dist = None
+                                        st.rerun()
+
+                            sel_labels = sel_labels if sel_labels else default_months
+                            sel_yms = [label_to_ym[l] for l in sel_labels if l in label_to_ym]
+                            sel_yms = sorted(sel_yms)
+                            if len(sel_yms) >= 4:
+                                sel_yms = sel_yms[-4:]
+                            sel_month_cols = [ym_to_label.get(ym, str(ym)) for ym in sel_yms]
+                            first3_yms = sel_yms[:-1] if len(sel_yms) >= 4 else sel_yms[:3]
+                            last_ym = sel_yms[-1] if len(sel_yms) >= 1 else None
+                            first3_cols = [ym_to_label.get(ym, str(ym)) for ym in first3_yms]
+                            last_col = ym_to_label.get(last_ym, str(last_ym)) if last_ym is not None else None
+
+                            drill_level = int(st.session_state.get("out_m_drill_level", 1) or 1)
+                            view_dim = "省区"
+                            group_col = "省区"
+                            df_level_base = df_trend_base.copy()
+                            df_level = df_trend_base.copy()
+
+                            if drill_level == 2:
+                                view_dim = "经销商"
+                                group_col = "经销商名称"
+                                prov_name = st.session_state.get("out_m_selected_prov")
+                                if prov_name:
+                                    st.caption(f"当前省区：**{prov_name}**（点击经销商可下钻到门店）")
+                                    df_level_base = df_level_base[df_level_base["省区"].astype(str).str.strip() == str(prov_name).strip()].copy()
+                                    df_level = df_level[df_level["省区"].astype(str).str.strip() == str(prov_name).strip()].copy()
+                            elif drill_level == 3:
+                                view_dim = "门店"
+                                group_col = "_门店名" if "_门店名" in df_level.columns else None
+                                prov_name = st.session_state.get("out_m_selected_prov")
+                                dist_name = st.session_state.get("out_m_selected_dist")
+                                if prov_name:
+                                    df_level_base = df_level_base[df_level_base["省区"].astype(str).str.strip() == str(prov_name).strip()].copy()
+                                    df_level = df_level[df_level["省区"].astype(str).str.strip() == str(prov_name).strip()].copy()
+                                if dist_name:
+                                    df_level_base = df_level_base[df_level_base["经销商名称"].astype(str).str.strip() == str(dist_name).strip()].copy()
+                                    df_level = df_level[df_level["经销商名称"].astype(str).str.strip() == str(dist_name).strip()].copy()
+                                st.caption(f"当前省区：**{prov_name or '—'}** ｜ 当前经销商：**{dist_name or '—'}**")
+                                if group_col is None:
+                                    st.info("未检测到门店字段，无法展示门店维度趋势")
+                                    df_level = df_level.iloc[0:0].copy()
+                                else:
+                                    df_level_base = df_level_base[df_level_base[group_col].notna()].copy()
+                                    df_level = df_level[df_level[group_col].notna()].copy()
+
+                            if sel_big != '全部' and '_模块大类' in df_level.columns:
+                                df_level = df_level[df_level['_模块大类'].astype(str).str.strip() == str(sel_big).strip()].copy()
+                            if sel_small != '全部' and '_模块小类' in df_level.columns:
+                                df_level = df_level[df_level['_模块小类'].astype(str).str.strip() == str(sel_small).strip()].copy()
+                            if sel_prod and '_模块出库产品' in df_level.columns:
+                                sel_prod_norm = [str(x).strip() for x in sel_prod if str(x).strip()]
+                                if sel_prod_norm:
+                                    df_level = df_level[df_level['_模块出库产品'].astype(str).str.strip().isin(sel_prod_norm)].copy()
+
+                            if (not sel_yms):
+                                st.info("请选择月份")
+                            else:
+                                if df_level.empty:
+                                    df_level = pd.DataFrame(columns=[group_col, "_ym", "数量(箱)"])
+                                else:
+                                    df_level = df_level[df_level["_ym"].isin(sel_yms)].copy()
+                                    df_level["数量(箱)"] = pd.to_numeric(df_level.get("数量(箱)", 0), errors="coerce").fillna(0.0)
+
+                                agg = (
+                                    df_level
+                                    .groupby([group_col, "_ym"], as_index=False)["数量(箱)"]
+                                    .sum()
+                                    .rename(columns={group_col: view_dim})
+                                )
+                                pv = agg.pivot(index=view_dim, columns="_ym", values="数量(箱)").fillna(0.0)
+
+                                df_names = df_trend_universe.copy()
+                                if drill_level == 2:
+                                    p = st.session_state.get("out_m_selected_prov")
+                                    if p and ('省区' in df_names.columns):
+                                        df_names = df_names[df_names['省区'].astype(str).str.strip() == str(p).strip()].copy()
+                                elif drill_level == 3:
+                                    p = st.session_state.get("out_m_selected_prov")
+                                    d = st.session_state.get("out_m_selected_dist")
+                                    if p and ('省区' in df_names.columns):
+                                        df_names = df_names[df_names['省区'].astype(str).str.strip() == str(p).strip()].copy()
+                                    if d and ('经销商名称' in df_names.columns):
+                                        df_names = df_names[df_names['经销商名称'].astype(str).str.strip() == str(d).strip()].copy()
+
+                                if sel_big != '全部' and '_模块大类' in df_names.columns:
+                                    df_names = df_names[df_names['_模块大类'].astype(str).str.strip() == str(sel_big).strip()].copy()
+                                if sel_small != '全部' and '_模块小类' in df_names.columns:
+                                    df_names = df_names[df_names['_模块小类'].astype(str).str.strip() == str(sel_small).strip()].copy()
+                                if sel_prod and '_模块出库产品' in df_names.columns:
+                                    sel_prod_norm = [str(x).strip() for x in sel_prod if str(x).strip()]
+                                    if sel_prod_norm:
+                                        df_names = df_names[df_names['_模块出库产品'].astype(str).str.strip().isin(sel_prod_norm)].copy()
+
+                                invalid_names = {'', 'nan', 'none', 'null'}
+                                if group_col == "省区":
+                                    all_provs = df_names['省区'].dropna().astype(str).str.strip().unique() if '省区' in df_names.columns else []
+                                    base_names = sorted([x for x in all_provs if x and x.lower() not in invalid_names])
+                                elif group_col == "经销商名称":
+                                    all_dists = df_names['经销商名称'].dropna().astype(str).str.strip().unique() if '经销商名称' in df_names.columns else []
+                                    base_names = sorted([x for x in all_dists if x and x.lower() not in invalid_names])
+                                else:
+                                    tmp = df_names[group_col].dropna().astype(str).str.strip().unique() if group_col in df_names.columns else []
+                                    base_names = sorted([x for x in tmp if x and x.lower() not in invalid_names])
+
+                                if base_names:
+                                    df_base_skeleton = pd.DataFrame({view_dim: base_names})
+                                    pv_reset = pv.reset_index()
+                                    if view_dim not in pv_reset.columns and len(pv_reset.columns) > 0:
+                                        pv_reset.rename(columns={pv_reset.columns[0]: view_dim}, inplace=True)
+                                    if view_dim in pv_reset.columns:
+                                        pv_reset[view_dim] = pv_reset[view_dim].astype(str).str.strip()
+                                        df_base_skeleton[view_dim] = df_base_skeleton[view_dim].astype(str).str.strip()
+                                        pv = df_base_skeleton.merge(pv_reset, on=view_dim, how="left").fillna(0.0).set_index(view_dim)
+                                    else:
+                                        pv = df_base_skeleton.set_index(view_dim)
+
+                                for ym in sel_yms:
+                                    if ym not in pv.columns:
+                                        pv[ym] = 0.0
+
+                                pv = pv[sel_yms]
+                                pv.columns = sel_month_cols
+                                pv["合计"] = pv.sum(axis=1)
+                                pv = pv.sort_values("合计", ascending=False).reset_index()
+
+                                avg_col = "前三月月均"
+                                if len(first3_cols) >= 1:
+                                    pv[avg_col] = pv[first3_cols].mean(axis=1)
+                                else:
+                                    pv[avg_col] = 0.0
+
+                                trend_base_cols = first3_cols if len(first3_cols) >= 1 else sel_month_cols
+                                spark_vals = pv[trend_base_cols].values.tolist() if trend_base_cols else [[] for _ in range(len(pv))]
+                                pv["_趋势数据"] = [json.dumps([float(x) for x in row]) for row in spark_vals]
+                                pv["趋势"] = pv["_趋势数据"]
+
+                                def _trend_tag(v1, v2, v3):
+                                    try:
+                                        a = float(v1 or 0)
+                                        b = float(v2 or 0)
+                                        c = float(v3 or 0)
+                                    except Exception:
+                                        return "—"
+                                    if a <= b <= c and (a < b or b < c):
+                                        return "持续增长"
+                                    if a >= b >= c and (a > b or b > c):
+                                        return "持续下滑"
+                                    if a > b and b < c:
+                                        return "先下滑后增长"
+                                    if a < b and b > c:
+                                        return "先增长后下滑"
+                                    return "波动"
+
+                                if len(trend_base_cols) >= 3:
+                                    pv["趋势类型"] = pv.apply(lambda r: _trend_tag(r[trend_base_cols[0]], r[trend_base_cols[1]], r[trend_base_cols[2]]), axis=1)
+                                else:
+                                    pv["趋势类型"] = "—"
+
+                                mnums = []
+                                for _m in first3_cols[:3]:
+                                    mm = re.search(r"年(\d{1,2})月", str(_m))
+                                    if mm:
+                                        mnums.append(str(int(mm.group(1))))
+                                avg_header = f"前三月月均（{'、'.join(mnums)}）" if len(mnums) == 3 else "前三月月均"
+
+                                region_label = "全国省区"
+                                if drill_level == 2:
+                                    region_label = str(st.session_state.get("out_m_selected_prov") or "").strip() or "省区"
+                                elif drill_level == 3:
+                                    region_label = str(st.session_state.get("out_m_selected_dist") or "").strip() or "经销商"
+
+                                prod_txt = "全部"
+                                if sel_prod:
+                                    prod_norm = [str(x).strip() for x in sel_prod if str(x).strip()]
+                                    if prod_norm:
+                                        prod_txt = "、".join(prod_norm)
+
+                                filter_line = f"筛选：月份={'、'.join([str(x) for x in sel_month_cols])}｜大类={sel_big}｜小类={sel_small}｜出库产品={prod_txt}"
+                                area_line = f"区域：{region_label}"
+
+                                export_cols = [view_dim]
+                                export_cols += [c for c in first3_cols if c in pv.columns]
+                                if avg_col in pv.columns:
+                                    export_cols.append(avg_col)
+                                if "趋势" in pv.columns:
+                                    export_cols.append("趋势")
+                                if "趋势类型" in pv.columns:
+                                    export_cols.append("趋势类型")
+                                if last_col and (last_col in pv.columns) and (last_col not in export_cols):
+                                    export_cols.append(last_col)
+                                if "合计" in pv.columns:
+                                    export_cols.append("合计")
+
+                                df_export = pv[export_cols].copy() if export_cols else pv.copy()
+                                if len(df_export) > 120:
+                                    df_export = df_export.head(120).copy()
+                                    area_line = f"{area_line}（仅导出前120行/共{int(len(pv))}行）"
+                                try:
+                                    total_export = {view_dim: "合计"}
+                                    for _c in export_cols:
+                                        if _c in (view_dim, "趋势", "趋势类型", "_趋势数据"):
+                                            continue
+                                        if _c in pv.columns:
+                                            total_export[_c] = float(pd.to_numeric(pv[_c], errors="coerce").fillna(0.0).sum())
+                                    if avg_col in export_cols and avg_col in pv.columns and len(first3_cols) >= 1:
+                                        _t3 = [float(pd.to_numeric(pv[c], errors="coerce").fillna(0.0).sum()) for c in first3_cols if c in pv.columns]
+                                        total_export[avg_col] = float(np.mean(_t3)) if _t3 else 0.0
+                                    if "趋势" in export_cols:
+                                        _spark_cols = trend_base_cols if 'trend_base_cols' in locals() and trend_base_cols else first3_cols
+                                        _spark_vals = [float(pd.to_numeric(pv[c], errors="coerce").fillna(0.0).sum()) for c in _spark_cols if c in pv.columns]
+                                        _spark_json = json.dumps([float(x) for x in _spark_vals]) if _spark_vals else json.dumps([])
+                                        total_export["趋势"] = _spark_json
+                                    if "趋势类型" in export_cols:
+                                        if '趋势' in total_export:
+                                            try:
+                                                _sv = json.loads(total_export["趋势"])
+                                            except Exception:
+                                                _sv = []
+                                        else:
+                                            _sv = []
+                                        if isinstance(_sv, list) and len(_sv) >= 3:
+                                            total_export["趋势类型"] = _trend_tag(_sv[0], _sv[1], _sv[2])
+                                        else:
+                                            total_export["趋势类型"] = "—"
+                                    df_export = pd.concat([df_export, pd.DataFrame([total_export])], ignore_index=True)
+                                except Exception:
+                                    pass
+                                col_types = {view_dim: "text"}
+                                for c in first3_cols:
+                                    if c in df_export.columns:
+                                        col_types[c] = "num"
+                                if avg_col in df_export.columns:
+                                    col_types[avg_col] = "num"
+                                if last_col and last_col in df_export.columns:
+                                    col_types[last_col] = "num"
+                                if "合计" in df_export.columns:
+                                    col_types["合计"] = "num"
+                                if "趋势" in df_export.columns:
+                                    col_types["趋势"] = "spark"
+                                if "趋势类型" in df_export.columns:
+                                    col_types["趋势类型"] = "tag"
+
+                                export_title_lines = [
+                                    f"月度出库趋势表 - {region_label}",
+                                    filter_line,
+                                    area_line,
+                                    f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                                ]
+                                export_id = f"out_m_export_{drill_level}"
+                                if st.button("生成表格图片（含趋势/颜色）", key=f"{export_id}_btn"):
+                                    st.session_state[f"{export_id}_png"] = _pil_table_png(df_export, export_title_lines, font_size=16, col_types=col_types)
+                                    st.session_state[f"{export_id}_name"] = f"月度出库趋势_{region_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                                if st.session_state.get(f"{export_id}_png"):
+                                    st.download_button(
+                                        "下载PNG",
+                                        data=st.session_state[f"{export_id}_png"],
+                                        file_name=st.session_state.get(f"{export_id}_name", "月度出库趋势.png"),
+                                        mime="image/png",
+                                        key=f"{export_id}_dl",
+                                    )
+
+                                def _compute_pv(level: int, prov: str | None = None, dist: str | None = None):
+                                    view = "省区"
+                                    grp = "省区"
+                                    d_base = df_trend_base.copy()
+                                    d = df_trend_base.copy()
+                                    if level == 2:
+                                        view = "经销商"
+                                        grp = "经销商名称"
+                                    elif level == 3:
+                                        view = "门店"
+                                        grp = "_门店名" if "_门店名" in d.columns else None
+                                    if prov:
+                                        d_base = d_base[d_base["省区"].astype(str).str.strip() == str(prov).strip()].copy()
+                                        d = d[d["省区"].astype(str).str.strip() == str(prov).strip()].copy()
+                                    if dist:
+                                        d_base = d_base[d_base["经销商名称"].astype(str).str.strip() == str(dist).strip()].copy()
+                                        d = d[d["经销商名称"].astype(str).str.strip() == str(dist).strip()].copy()
+                                    if grp is None:
+                                        return None, view, grp
+                                    d_base = d_base[d_base[grp].notna()].copy()
+                                    d = d[d[grp].notna()].copy()
+                                    if sel_big != '全部' and '_模块大类' in d.columns:
+                                        d = d[d['_模块大类'].astype(str).str.strip() == str(sel_big).strip()].copy()
+                                    if sel_small != '全部' and '_模块小类' in d.columns:
+                                        d = d[d['_模块小类'].astype(str).str.strip() == str(sel_small).strip()].copy()
+                                    if sel_prod and '_模块出库产品' in d.columns:
+                                        sel_prod_norm = [str(x).strip() for x in sel_prod if str(x).strip()]
+                                        if sel_prod_norm:
+                                            d = d[d['_模块出库产品'].astype(str).str.strip().isin(sel_prod_norm)].copy()
+                                    if d.empty:
+                                        d = pd.DataFrame(columns=[grp, "_ym", "数量(箱)"])
+                                    else:
+                                        d = d[d["_ym"].isin(sel_yms)].copy()
+                                        d["数量(箱)"] = pd.to_numeric(d.get("数量(箱)", 0), errors="coerce").fillna(0.0)
+                                    agg2 = (
+                                        d.groupby([grp, "_ym"], as_index=False)["数量(箱)"]
+                                        .sum()
+                                        .rename(columns={grp: view})
+                                    )
+                                    pv2 = agg2.pivot(index=view, columns="_ym", values="数量(箱)").fillna(0.0)
+
+                                    df_names2 = df_trend_universe.copy()
+                                    if prov and '省区' in df_names2.columns:
+                                        df_names2 = df_names2[df_names2['省区'].astype(str).str.strip() == str(prov).strip()].copy()
+                                    if dist and '经销商名称' in df_names2.columns:
+                                        df_names2 = df_names2[df_names2['经销商名称'].astype(str).str.strip() == str(dist).strip()].copy()
+                                    if sel_big != '全部' and '_模块大类' in df_names2.columns:
+                                        df_names2 = df_names2[df_names2['_模块大类'].astype(str).str.strip() == str(sel_big).strip()].copy()
+                                    if sel_small != '全部' and '_模块小类' in df_names2.columns:
+                                        df_names2 = df_names2[df_names2['_模块小类'].astype(str).str.strip() == str(sel_small).strip()].copy()
+                                    if sel_prod and '_模块出库产品' in df_names2.columns:
+                                        sel_prod_norm = [str(x).strip() for x in sel_prod if str(x).strip()]
+                                        if sel_prod_norm:
+                                            df_names2 = df_names2[df_names2['_模块出库产品'].astype(str).str.strip().isin(sel_prod_norm)].copy()
+
+                                    invalid_names = {'', 'nan', 'none', 'null'}
+                                    if grp == "省区" and '省区' in df_names2.columns:
+                                        base2 = df_names2['省区'].dropna().astype(str).str.strip().unique().tolist()
+                                    elif grp == "经销商名称" and '经销商名称' in df_names2.columns:
+                                        base2 = df_names2['经销商名称'].dropna().astype(str).str.strip().unique().tolist()
+                                    else:
+                                        base2 = df_names2[grp].dropna().astype(str).str.strip().unique().tolist() if grp in df_names2.columns else []
+                                    base2 = sorted([x for x in base2 if x and x.lower() not in invalid_names])
+                                    if base2:
+                                        df_skel = pd.DataFrame({view: base2})
+                                        pv_reset2 = pv2.reset_index()
+                                        if view not in pv_reset2.columns and len(pv_reset2.columns) > 0:
+                                            pv_reset2.rename(columns={pv_reset2.columns[0]: view}, inplace=True)
+                                        if view in pv_reset2.columns:
+                                            pv_reset2[view] = pv_reset2[view].astype(str).str.strip()
+                                            df_skel[view] = df_skel[view].astype(str).str.strip()
+                                            pv2 = df_skel.merge(pv_reset2, on=view, how="left").fillna(0.0).set_index(view)
+                                        else:
+                                            pv2 = df_skel.set_index(view)
+                                    for ym in sel_yms:
+                                        if ym not in pv2.columns:
+                                            pv2[ym] = 0.0
+                                    pv2 = pv2[sel_yms]
+                                    pv2.columns = sel_month_cols
+                                    pv2["合计"] = pv2.sum(axis=1)
+                                    pv2 = pv2.sort_values("合计", ascending=False).reset_index()
+                                    pv2[avg_col] = pv2[first3_cols].mean(axis=1) if len(first3_cols) >= 1 else 0.0
+                                    spark_vals2 = pv2[trend_base_cols].values.tolist() if trend_base_cols else [[] for _ in range(len(pv2))]
+                                    pv2["_趋势数据"] = [json.dumps([float(x) for x in row]) for row in spark_vals2]
+                                    pv2["趋势"] = pv2["_趋势数据"]
+                                    if len(trend_base_cols) >= 3:
+                                        pv2["趋势类型"] = pv2.apply(lambda r: _trend_tag(r[trend_base_cols[0]], r[trend_base_cols[1]], r[trend_base_cols[2]]), axis=1)
+                                    else:
+                                        pv2["趋势类型"] = "—"
+                                    return pv2, view, grp
+
+                                batch_id = f"out_m_batch_{drill_level}"
+                                if drill_level in (1, 2):
+                                    label = "全部导出省区图片ZIP" if drill_level == 1 else "全部导出经销商图片ZIP"
+                                    if st.button(label, key=f"{batch_id}_btn"):
+                                        targets = []
+                                        if drill_level == 1:
+                                            targets = base_names
+                                        else:
+                                            targets = base_names
+                                        zip_buf = io.BytesIO()
+                                        with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                                            prog = st.progress(0)
+                                            total = max(1, len(targets))
+                                            for idx, name in enumerate(targets):
+                                                if drill_level == 1:
+                                                    pv_t, v_t, _ = _compute_pv(2, prov=name, dist=None)
+                                                    region_t = str(name)
+                                                else:
+                                                    pv_t, v_t, _ = _compute_pv(3, prov=st.session_state.get("out_m_selected_prov"), dist=name)
+                                                    region_t = str(name)
+                                                if pv_t is None or pv_t.empty:
+                                                    prog.progress(int((idx + 1) * 100 / total))
+                                                    continue
+                                                export_cols_t = [v_t]
+                                                export_cols_t += [c for c in first3_cols if c in pv_t.columns]
+                                                if avg_col in pv_t.columns:
+                                                    export_cols_t.append(avg_col)
+                                                if "趋势" in pv_t.columns:
+                                                    export_cols_t.append("趋势")
+                                                if "趋势类型" in pv_t.columns:
+                                                    export_cols_t.append("趋势类型")
+                                                if last_col and (last_col in pv_t.columns) and (last_col not in export_cols_t):
+                                                    export_cols_t.append(last_col)
+                                                if "合计" in pv_t.columns:
+                                                    export_cols_t.append("合计")
+                                                df_t = pv_t[export_cols_t].copy()
+
+                                                try:
+                                                    total_row = {v_t: "合计"}
+                                                    for _c in export_cols_t:
+                                                        if _c in (v_t, "趋势", "趋势类型", "_趋势数据"):
+                                                            continue
+                                                        total_row[_c] = float(pd.to_numeric(pv_t[_c], errors="coerce").fillna(0.0).sum()) if _c in pv_t.columns else 0.0
+                                                    if avg_col in export_cols_t and len(first3_cols) >= 1:
+                                                        _t3 = [float(pd.to_numeric(pv_t[c], errors="coerce").fillna(0.0).sum()) for c in first3_cols if c in pv_t.columns]
+                                                        total_row[avg_col] = float(np.mean(_t3)) if _t3 else 0.0
+                                                    if "趋势" in export_cols_t:
+                                                        _spark_vals = [float(pd.to_numeric(pv_t[c], errors="coerce").fillna(0.0).sum()) for c in trend_base_cols if c in pv_t.columns]
+                                                        total_row["趋势"] = json.dumps([float(x) for x in _spark_vals]) if _spark_vals else json.dumps([])
+                                                    if "趋势类型" in export_cols_t:
+                                                        try:
+                                                            _sv = json.loads(total_row.get("趋势", "[]"))
+                                                        except Exception:
+                                                            _sv = []
+                                                        total_row["趋势类型"] = _trend_tag(_sv[0], _sv[1], _sv[2]) if isinstance(_sv, list) and len(_sv) >= 3 else "—"
+                                                    df_t = pd.concat([df_t, pd.DataFrame([total_row])], ignore_index=True)
+                                                except Exception:
+                                                    pass
+
+                                                col_types_t = {v_t: "text"}
+                                                for c in first3_cols:
+                                                    if c in df_t.columns:
+                                                        col_types_t[c] = "num"
+                                                if avg_col in df_t.columns:
+                                                    col_types_t[avg_col] = "num"
+                                                if last_col and last_col in df_t.columns:
+                                                    col_types_t[last_col] = "num"
+                                                if "合计" in df_t.columns:
+                                                    col_types_t["合计"] = "num"
+                                                if "趋势" in df_t.columns:
+                                                    col_types_t["趋势"] = "spark"
+                                                if "趋势类型" in df_t.columns:
+                                                    col_types_t["趋势类型"] = "tag"
+
+                                                title_lines_t = [
+                                                    f"月度出库趋势表 - {region_t}",
+                                                    filter_line,
+                                                    f"区域：{region_t}",
+                                                    f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                                                ]
+                                                png = _pil_table_png(df_t, title_lines_t, font_size=16, col_types=col_types_t)
+                                                fname = sanitize_filename(region_t, default="export") + ".png"
+                                                zf.writestr(fname, png)
+                                                prog.progress(int((idx + 1) * 100 / total))
+                                        st.session_state[f"{batch_id}_zip"] = zip_buf.getvalue()
+                                        st.session_state[f"{batch_id}_zip_name"] = f"{label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+                                    if st.session_state.get(f"{batch_id}_zip"):
+                                        st.download_button(
+                                            "下载ZIP",
+                                            data=st.session_state[f"{batch_id}_zip"],
+                                            file_name=st.session_state.get(f"{batch_id}_zip_name", f"{label}.zip"),
+                                            mime="application/zip",
+                                            key=f"{batch_id}_dl",
+                                        )
+
+                                month_first3_defs = []
+                                for i, m in enumerate(first3_cols):
+                                    month_first3_defs.append({
+                                        "headerName": m,
+                                        "field": m,
+                                        "type": ["numericColumn", "numberColumnFilter"],
+                                        "valueFormatter": JS_FMT_NUM,
+                                        "width": 110,
+                                    })
+                                    if i == 2:
+                                        month_first3_defs.append({
+                                            "headerName": avg_header,
+                                            "field": avg_col,
+                                            "type": ["numericColumn", "numberColumnFilter"],
+                                            "valueFormatter": JS_FMT_NUM,
+                                            "width": 150,
+                                        })
+                                if len(first3_cols) < 3:
+                                    month_first3_defs.append({
+                                        "headerName": avg_header,
+                                        "field": avg_col,
+                                        "type": ["numericColumn", "numberColumnFilter"],
+                                        "valueFormatter": JS_FMT_NUM,
+                                        "width": 150,
+                                    })
+                                last_month_defs = []
+                                if last_col and last_col not in first3_cols:
+                                    last_month_defs = [
+                                        {
+                                            "headerName": last_col,
+                                            "field": last_col,
+                                            "type": ["numericColumn", "numberColumnFilter"],
+                                            "valueFormatter": JS_FMT_NUM,
+                                            "width": 110,
+                                        }
+                                    ]
+
+                                col_defs = [
+                                    {"headerName": view_dim, "field": view_dim, "minWidth": 220, "pinned": "left", "tooltipField": view_dim},
+                                    {"headerName": "趋势", "field": "趋势", "cellRenderer": JS_SPARKLINE, "cellRendererParams": {"width": 120, "height": 28}, "width": 140},
+                                    {"headerName": "趋势类型", "field": "趋势类型", "cellRenderer": JS_TREND_TAG, "width": 150},
+                                    *last_month_defs,
+                                    {"headerName": "合计", "field": "合计", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 110},
+                                    {"headerName": "_趋势数据", "field": "_趋势数据", "hide": True},
+                                ]
+                                col_defs = [col_defs[0], *month_first3_defs, *col_defs[1:]]
+
+                                pinned_total = {view_dim: "合计"}
+                                try:
+                                    _num_cols = []
+                                    for _c in first3_cols:
+                                        if _c in pv.columns:
+                                            _num_cols.append(_c)
+                                    if avg_col in pv.columns:
+                                        _num_cols.append(avg_col)
+                                    if last_col and last_col in pv.columns:
+                                        _num_cols.append(last_col)
+                                    if "合计" in pv.columns:
+                                        _num_cols.append("合计")
+                                    for _c in _num_cols:
+                                        pinned_total[_c] = float(pd.to_numeric(pv[_c], errors="coerce").fillna(0.0).sum())
+                                    if avg_col in pv.columns and len(first3_cols) >= 1:
+                                        _t3 = [float(pd.to_numeric(pv[c], errors="coerce").fillna(0.0).sum()) for c in first3_cols if c in pv.columns]
+                                        pinned_total[avg_col] = float(np.mean(_t3)) if _t3 else 0.0
+                                    _spark_cols = trend_base_cols if 'trend_base_cols' in locals() and trend_base_cols else first3_cols
+                                    _spark_vals = [float(pd.to_numeric(pv[c], errors="coerce").fillna(0.0).sum()) for c in _spark_cols if c in pv.columns]
+                                    _spark_json = json.dumps([float(x) for x in _spark_vals]) if _spark_vals else json.dumps([])
+                                    pinned_total["_趋势数据"] = _spark_json
+                                    pinned_total["趋势"] = _spark_json
+                                    if len(_spark_vals) >= 3:
+                                        pinned_total["趋势类型"] = _trend_tag(_spark_vals[0], _spark_vals[1], _spark_vals[2])
+                                    else:
+                                        pinned_total["趋势类型"] = "—"
+                                except Exception:
+                                    pinned_total["_趋势数据"] = json.dumps([])
+                                    pinned_total["趋势"] = json.dumps([])
+                                    pinned_total["趋势类型"] = "—"
+
+                                gridOptions = {
+                                    "pinnedBottomRowData": [pinned_total],
+                                    "columnDefs": col_defs,
+                                    "defaultColDef": {
+                                        "resizable": True,
+                                        "sortable": True,
+                                        "filter": True,
+                                        "wrapHeaderText": True,
+                                        "autoHeaderHeight": True,
+                                        "cellStyle": {"textAlign": "center", "display": "flex", "justifyContent": "center", "alignItems": "center"},
+                                        "headerClass": "ag-header-center",
+                                    },
+                                    "rowHeight": 40,
+                                    "headerHeight": 56,
+                                    "animateRows": True,
+                                    "suppressCellFocus": True,
+                                    "enableCellTextSelection": True,
+                                    "suppressDragLeaveHidesColumns": True,
+                                    "alwaysShowHorizontalScroll": True,
+                                }
+                                if drill_level in (1, 2):
+                                    gridOptions["rowSelection"] = "single"
+
+                                n_rows = int(len(pv))
+                                row_h = 40
+                                header_h = 56
+                                padding_h = 140
+                                min_h = 520
+                                max_h = 1400
+                                full_h = header_h + (n_rows * row_h) + padding_h
+                                final_h = int(min(max_h, max(min_h, full_h)))
+                                gridOptions["pagination"] = False
+
+                                ag_key = "out_m_prov_ag" if drill_level == 1 else ("out_m_dist_ag" if drill_level == 2 else "out_m_store_ag")
+                                st.caption(f"{view_dim}数量：{int(len(pv))}（可滚动查看全部）")
+                                ag = AgGrid(
+                                    pv,
+                                    gridOptions=gridOptions,
+                                    height=int(final_h),
+                                    width="100%",
+                                    data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                                    update_mode=GridUpdateMode.SELECTION_CHANGED,
+                                    fit_columns_on_grid_load=False,
+                                    allow_unsafe_jscode=True,
+                                    theme="streamlit",
+                                    key=ag_key,
+                                )
+                                selected_rows = ag.get("selected_rows") if ag else None
+                                if selected_rows is not None and len(selected_rows) > 0 and drill_level in (1, 2):
+                                    if isinstance(selected_rows, pd.DataFrame):
+                                        first_row = selected_rows.iloc[0]
+                                    else:
+                                        first_row = selected_rows[0]
+
+                                    selected_name = first_row.get(view_dim) if isinstance(first_row, dict) else first_row[view_dim]
+
+                                    if drill_level == 1:
+                                        st.session_state.out_m_selected_prov = selected_name
+                                        st.session_state.out_m_drill_level = 2
+                                        st.session_state.out_m_selected_dist = None
+                                        st.rerun()
+                                    elif drill_level == 2:
+                                        st.session_state.out_m_selected_dist = selected_name
+                                        st.session_state.out_m_drill_level = 3
+                                        st.rerun()
 
                     st.markdown("</div>", unsafe_allow_html=True)
 
                     # === TAB 7: PERFORMANCE ===
-            with tab7:
+            if main_tab == "🚀 业绩分析":
                 st.markdown("""
                 <style>
                   .perf-wrap {display:flex; flex-direction:column; gap:16px;}
