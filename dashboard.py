@@ -15,6 +15,9 @@ from datetime import datetime
 import html as _html
 from PIL import Image, ImageDraw, ImageFont
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, JsCode
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 def _is_nan(x):
     try:
         return x != x
@@ -46,6 +49,104 @@ def sanitize_filename(name: str, default: str = "export"):
     s = re.sub(r"[\\\\/:*?\"<>|]+", "_", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s[:120] if len(s) > 120 else s
+
+def _df_to_excel_bytes(df: pd.DataFrame, sheet_name: str, title_lines: list[str] | None = None, number_headers: set[str] | None = None, trend_type_header: str | None = None):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    buf.seek(0)
+    wb = load_workbook(buf)
+    ws = wb[sheet_name]
+
+    title_lines = title_lines or []
+    insert_n = len(title_lines) + (1 if title_lines else 0)
+    if insert_n:
+        ws.insert_rows(1, amount=insert_n)
+        end_col = get_column_letter(ws.max_column)
+        for i, line in enumerate(title_lines, start=1):
+            ws.merge_cells(f"A{i}:{end_col}{i}")
+            c = ws[f"A{i}"]
+            c.value = str(line)
+            c.font = Font(bold=True, size=12, color="111827")
+            c.alignment = Alignment(horizontal="left", vertical="center")
+
+    header_row = (len(title_lines) + 2) if title_lines else 1
+    ws.freeze_panes = f"A{header_row + 1}"
+
+    header_fill = PatternFill("solid", fgColor="111827")
+    header_font = Font(bold=True, color="FFFFFF")
+    thin = Side(style="thin", color="D1D5DB")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    headers = []
+    for col in range(1, ws.max_column + 1):
+        v = ws.cell(row=header_row, column=col).value
+        headers.append(str(v) if v is not None else "")
+
+    trend_col_idx = None
+    if trend_type_header:
+        try:
+            trend_col_idx = headers.index(trend_type_header) + 1
+        except ValueError:
+            trend_col_idx = None
+
+    for col in range(1, ws.max_column + 1):
+        c = ws.cell(row=header_row, column=col)
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = border
+
+    max_rows_for_full_style = 12000
+    apply_full = ws.max_row <= max_rows_for_full_style
+    num_fmt = "#,##0.0"
+    number_headers = number_headers or set()
+
+    even_fill = PatternFill("solid", fgColor="F8FAFC")
+    total_fill = PatternFill("solid", fgColor="FEF9C3")
+
+    for r in range(header_row + 1, ws.max_row + 1):
+        is_total_row = str(ws.cell(row=r, column=1).value or "").strip() == "合计"
+        for col in range(1, ws.max_column + 1):
+            cell = ws.cell(row=r, column=col)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            if apply_full:
+                cell.border = border
+                if (r - header_row) % 2 == 0:
+                    cell.fill = even_fill
+                if is_total_row:
+                    cell.fill = total_fill
+                    cell.font = Font(bold=True, color="111827")
+            if headers[col - 1] in number_headers:
+                cell.number_format = num_fmt
+            if trend_col_idx and col == trend_col_idx:
+                v = str(cell.value or "").strip()
+                if v == "持续增长":
+                    cell.fill = PatternFill("solid", fgColor="DCFCE7")
+                    cell.font = Font(bold=True, color="166534")
+                elif v == "持续下滑":
+                    cell.fill = PatternFill("solid", fgColor="FEE2E2")
+                    cell.font = Font(bold=True, color="991B1B")
+                elif v == "先下滑后增长":
+                    cell.fill = PatternFill("solid", fgColor="DBEAFE")
+                    cell.font = Font(bold=True, color="1D4ED8")
+                elif v == "先增长后下滑":
+                    cell.fill = PatternFill("solid", fgColor="FEF9C3")
+                    cell.font = Font(bold=True, color="A16207")
+
+    for col in range(1, ws.max_column + 1):
+        col_letter = get_column_letter(col)
+        max_len = 0
+        for r in range(1, min(ws.max_row, header_row + 2000) + 1):
+            v = ws.cell(row=r, column=col).value
+            if v is None:
+                continue
+            max_len = max(max_len, len(str(v)))
+        ws.column_dimensions[col_letter].width = max(10, min(36, max_len + 2))
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
 
 def fmt_pct_ratio(r, na="—", decimals=1):
     if r is None or _is_nan(r):
@@ -303,22 +404,43 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed"
 )
-st.markdown('<meta name="google" content="notranslate" />', unsafe_allow_html=True)
-st.markdown("""
+import streamlit.components.v1 as components
+
+components.html(
+    """
 <script>
-  // Force disable translation
-  document.documentElement.setAttribute("translate", "no");
-  document.documentElement.classList.add("notranslate");
-  document.body.setAttribute("translate", "no");
-  document.body.classList.add("notranslate");
-  
-  // Inject meta tag to head
-  var meta = document.createElement('meta');
-  meta.name = "google";
-  meta.content = "notranslate";
-  document.getElementsByTagName('head')[0].appendChild(meta);
+(() => {
+  const doc = window.parent && window.parent.document ? window.parent.document : document;
+  const ensure = () => {
+    if (!doc || !doc.documentElement) return;
+
+    doc.documentElement.setAttribute("translate", "no");
+    doc.documentElement.classList.add("notranslate");
+
+    if (doc.body) {
+      doc.body.setAttribute("translate", "no");
+      doc.body.classList.add("notranslate");
+    }
+
+    const head = doc.head || (doc.getElementsByTagName("head")[0] || null);
+    if (head && !head.querySelector('meta[name="google"][content="notranslate"]')) {
+      const meta = doc.createElement("meta");
+      meta.name = "google";
+      meta.content = "notranslate";
+      head.appendChild(meta);
+    }
+  };
+
+  ensure();
+  const t = setInterval(() => {
+    ensure();
+    if (doc && doc.body) clearInterval(t);
+  }, 100);
+})();
 </script>
-""", unsafe_allow_html=True)
+""",
+    height=0,
+)
 
 _required_password = os.getenv("DASHBOARD_PASSWORD", "").strip()
 if _required_password:
@@ -5709,6 +5831,261 @@ if uploaded_file:
                                     f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                                 ]
                                 export_id = f"out_m_export_{drill_level}"
+                                def _build_current_excel_df():
+                                    cols = [view_dim]
+                                    cols += [c for c in first3_cols if c in pv.columns]
+                                    if avg_col in pv.columns:
+                                        cols.append(avg_col)
+                                    if "趋势类型" in pv.columns:
+                                        cols.append("趋势类型")
+                                    if last_col and (last_col in pv.columns) and (last_col not in cols):
+                                        cols.append(last_col)
+                                    if "合计" in pv.columns:
+                                        cols.append("合计")
+                                    df_x = pv[cols].copy() if cols else pv.copy()
+                                    if avg_col in df_x.columns:
+                                        df_x.rename(columns={avg_col: avg_header}, inplace=True)
+
+                                    months = [c for c in first3_cols if c in df_x.columns]
+                                    if last_col and last_col in df_x.columns and last_col not in months:
+                                        months.append(last_col)
+
+                                    anchor = months[-1] if months else None
+                                    if months and first3_cols:
+                                        m3 = [c for c in first3_cols if c in df_x.columns]
+                                        if m3:
+                                            anchor = m3[-1]
+
+                                    before = []
+                                    after = []
+                                    if anchor and anchor in months:
+                                        idx = months.index(anchor)
+                                        before = months[: idx + 1]
+                                        after = months[idx + 1 :]
+                                    else:
+                                        before = months
+
+                                    ordered = [view_dim]
+                                    ordered += before
+                                    if avg_header in df_x.columns:
+                                        ordered.append(avg_header)
+                                    if "趋势类型" in df_x.columns:
+                                        ordered.append("趋势类型")
+                                    ordered += after
+                                    if "合计" in df_x.columns:
+                                        ordered.append("合计")
+                                    ordered = [c for c in ordered if c in df_x.columns]
+                                    if ordered:
+                                        df_x = df_x[ordered].copy()
+                                    return df_x
+
+                                def _build_store_detail_df(all_provinces: bool):
+                                    d = df_trend_base.copy()
+                                    store_col = "_门店名" if "_门店名" in d.columns else ("门店名称" if "门店名称" in d.columns else None)
+                                    if store_col is None:
+                                        cols0 = ["省区", "经销商", "门店"]
+                                        if sel_month_cols:
+                                            cols0.append(sel_month_cols[0])
+                                        cols0 += [avg_header, "趋势类型"]
+                                        cols0 += [c for c in sel_month_cols if sel_month_cols and c != sel_month_cols[0]]
+                                        cols0.append("合计")
+                                        cols0 = [c for c in cols0 if c]
+                                        return pd.DataFrame(columns=cols0)
+
+                                    prov_sel = str(st.session_state.get("out_m_selected_prov") or "").strip()
+                                    dist_sel = str(st.session_state.get("out_m_selected_dist") or "").strip()
+                                    if not all_provinces and prov_sel:
+                                        d = d[d["省区"].astype(str).str.strip() == prov_sel].copy()
+                                    if drill_level == 3 and dist_sel:
+                                        d = d[d["经销商名称"].astype(str).str.strip() == dist_sel].copy()
+
+                                    if sel_big != '全部' and '_模块大类' in d.columns:
+                                        d = d[d['_模块大类'].astype(str).str.strip() == str(sel_big).strip()].copy()
+                                    if sel_small != '全部' and '_模块小类' in d.columns:
+                                        d = d[d['_模块小类'].astype(str).str.strip() == str(sel_small).strip()].copy()
+                                    if sel_prod and '_模块出库产品' in d.columns:
+                                        sel_prod_norm = [str(x).strip() for x in sel_prod if str(x).strip()]
+                                        if sel_prod_norm:
+                                            d = d[d['_模块出库产品'].astype(str).str.strip().isin(sel_prod_norm)].copy()
+
+                                    d = d[d["_ym"].isin(sel_yms)].copy()
+                                    if d.empty:
+                                        return pd.DataFrame(columns=["省区", "经销商", "门店"] + sel_month_cols + ["合计"])
+
+                                    d["数量(箱)"] = pd.to_numeric(d.get("数量(箱)", 0), errors="coerce").fillna(0.0)
+                                    d["省区"] = d["省区"].fillna("").astype(str).str.strip()
+                                    d["经销商名称"] = d["经销商名称"].fillna("").astype(str).str.strip()
+                                    d[store_col] = d[store_col].fillna("").astype(str).str.strip()
+                                    d = d[(d[store_col] != "") & (d["经销商名称"] != "")].copy()
+
+                                    g = d.groupby(["省区", "经销商名称", store_col, "_ym"], as_index=False)["数量(箱)"].sum()
+                                    pv_s = g.pivot(index=["省区", "经销商名称", store_col], columns="_ym", values="数量(箱)").fillna(0.0)
+                                    for ym in sel_yms:
+                                        if ym not in pv_s.columns:
+                                            pv_s[ym] = 0.0
+                                    pv_s = pv_s[sel_yms]
+                                    pv_s.columns = sel_month_cols
+                                    pv_s["合计"] = pv_s.sum(axis=1)
+                                    pv_s = pv_s.reset_index().rename(columns={"经销商名称": "经销商", store_col: "门店"})
+                                    pv_s = pv_s.sort_values("合计", ascending=False).reset_index(drop=True)
+
+                                    tcols = [c for c in first3_cols if c in pv_s.columns]
+                                    if tcols:
+                                        pv_s[avg_header] = pv_s[tcols].mean(axis=1)
+                                    else:
+                                        pv_s[avg_header] = 0.0
+                                    if len(tcols) >= 3:
+                                        pv_s["趋势类型"] = pv_s.apply(lambda r: _trend_tag(r[tcols[0]], r[tcols[1]], r[tcols[2]]), axis=1)
+                                    else:
+                                        pv_s["趋势类型"] = "—"
+
+                                    months = [c for c in sel_month_cols if c in pv_s.columns]
+                                    anchor = tcols[-1] if tcols else (months[-1] if months else None)
+                                    before = []
+                                    after = []
+                                    if anchor and anchor in months:
+                                        idx = months.index(anchor)
+                                        before = months[: idx + 1]
+                                        after = months[idx + 1 :]
+                                    else:
+                                        before = months
+
+                                    ordered = ["省区", "经销商", "门店"]
+                                    ordered += before
+                                    ordered.append(avg_header)
+                                    ordered.append("趋势类型")
+                                    ordered += after
+                                    ordered.append("合计")
+                                    ordered = [c for c in ordered if c in pv_s.columns]
+                                    pv_s = pv_s[ordered].copy()
+                                    return pv_s
+
+                                number_headers_current = set([c for c in first3_cols if c in pv.columns])
+                                number_headers_current |= {avg_header, last_col or "", "合计"}
+                                number_headers_current.discard("")
+
+                                if "out_m_excel_cache" not in st.session_state:
+                                    st.session_state.out_m_excel_cache = {}
+                                _excel_cache = st.session_state.out_m_excel_cache
+
+                                _prov_sel = str(st.session_state.get("out_m_selected_prov") or "").strip()
+                                _dist_sel = str(st.session_state.get("out_m_selected_dist") or "").strip()
+                                _prod_norm_key = tuple(sorted([str(x).strip() for x in (sel_prod or []) if str(x).strip()]))
+
+                                def _excel_key(kind: str):
+                                    return (
+                                        kind,
+                                        sig,
+                                        int(drill_level),
+                                        tuple(sel_yms),
+                                        tuple(sel_month_cols),
+                                        tuple(first3_cols),
+                                        str(last_col or ""),
+                                        str(avg_header or ""),
+                                        str(sel_big or ""),
+                                        str(sel_small or ""),
+                                        _prod_norm_key,
+                                        _prov_sel,
+                                        _dist_sel,
+                                    )
+
+                                now_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                                if drill_level == 1:
+                                    k_cur = _excel_key("cur")
+                                    c_e1, c_e2, _ = st.columns([1.1, 1.6, 6.3])
+                                    with c_e1:
+                                        if st.button("生成Excel（当前表）", key=f"{export_id}_gen_cur"):
+                                            with st.spinner("正在生成Excel（当前表）…"):
+                                                df_x = _build_current_excel_df()
+                                                xlsx_bytes = _df_to_excel_bytes(
+                                                    df_x,
+                                                    sheet_name="趋势分析",
+                                                    title_lines=export_title_lines,
+                                                    number_headers=number_headers_current,
+                                                    trend_type_header="趋势类型",
+                                                )
+                                                _excel_cache[k_cur] = {
+                                                    "bytes": xlsx_bytes,
+                                                    "name": sanitize_filename(f"出库趋势分析_分省区_{now_tag}.xlsx"),
+                                                }
+                                    with c_e2:
+                                        if k_cur in _excel_cache:
+                                            st.download_button(
+                                                "下载Excel（当前表）",
+                                                data=_excel_cache[k_cur]["bytes"],
+                                                file_name=_excel_cache[k_cur]["name"],
+                                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                                key=f"{export_id}_dl_cur",
+                                            )
+
+                                    k_all = _excel_key("all_store")
+                                    c_a1, c_a2, _ = st.columns([1.1, 1.9, 6.0])
+                                    with c_a1:
+                                        if st.button("生成导出全部", key=f"{export_id}_gen_all"):
+                                            with st.spinner("正在生成导出全部（门店明细），数据量较大请稍候…"):
+                                                df_all = _build_store_detail_df(all_provinces=True)
+                                                title_all = [
+                                                    "月度出库趋势表 - 导出全部门店明细",
+                                                    filter_line,
+                                                    "区域：全部省区（省区→经销商→门店）",
+                                                    f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                                                ]
+                                                number_headers_all = set(sel_month_cols + [avg_header, "合计"])
+                                                xlsx_all = _df_to_excel_bytes(
+                                                    df_all,
+                                                    sheet_name="趋势分析",
+                                                    title_lines=title_all,
+                                                    number_headers=number_headers_all,
+                                                    trend_type_header="趋势类型",
+                                                )
+                                                _excel_cache[k_all] = {
+                                                    "bytes": xlsx_all,
+                                                    "name": sanitize_filename(f"出库趋势分析_门店明细_全部省区_{now_tag}.xlsx"),
+                                                }
+                                    with c_a2:
+                                        if k_all in _excel_cache:
+                                            st.download_button(
+                                                "下载导出全部（门店明细）",
+                                                data=_excel_cache[k_all]["bytes"],
+                                                file_name=_excel_cache[k_all]["name"],
+                                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                                key=f"{export_id}_dl_all",
+                                            )
+                                else:
+                                    k_detail = _excel_key("detail_store")
+                                    c_d1, c_d2, _ = st.columns([1.3, 2.0, 5.7])
+                                    with c_d1:
+                                        if st.button("生成门店明细Excel", key=f"{export_id}_gen_detail"):
+                                            with st.spinner("正在生成门店明细Excel…"):
+                                                df_detail = _build_store_detail_df(all_provinces=False)
+                                                title_detail = [
+                                                    f"月度出库趋势表 - {region_label}（门店明细）",
+                                                    filter_line,
+                                                    area_line,
+                                                    f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                                                ]
+                                                number_headers_detail = set(sel_month_cols + [avg_header, "合计"])
+                                                xlsx_detail = _df_to_excel_bytes(
+                                                    df_detail,
+                                                    sheet_name="趋势分析",
+                                                    title_lines=title_detail,
+                                                    number_headers=number_headers_detail,
+                                                    trend_type_header="趋势类型",
+                                                )
+                                                _excel_cache[k_detail] = {
+                                                    "bytes": xlsx_detail,
+                                                    "name": sanitize_filename(f"出库趋势分析_门店明细_{region_label}_{now_tag}.xlsx"),
+                                                }
+                                    with c_d2:
+                                        if k_detail in _excel_cache:
+                                            st.download_button(
+                                                "下载门店明细Excel",
+                                                data=_excel_cache[k_detail]["bytes"],
+                                                file_name=_excel_cache[k_detail]["name"],
+                                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                                key=f"{export_id}_dl_detail",
+                                            )
                                 if st.button("生成表格图片（含趋势/颜色）", key=f"{export_id}_btn"):
                                     st.session_state[f"{export_id}_png"] = _pil_table_png(df_export, export_title_lines, font_size=16, col_types=col_types)
                                     st.session_state[f"{export_id}_name"] = f"月度出库趋势_{region_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
