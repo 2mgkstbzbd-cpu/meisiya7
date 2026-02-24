@@ -50,7 +50,16 @@ def sanitize_filename(name: str, default: str = "export"):
     s = re.sub(r"\s+", " ", s).strip()
     return s[:120] if len(s) > 120 else s
 
-def _df_to_excel_bytes(df: pd.DataFrame, sheet_name: str, title_lines: list[str] | None = None, number_headers: set[str] | None = None, trend_type_header: str | None = None):
+def _df_to_excel_bytes(
+    df: pd.DataFrame,
+    sheet_name: str,
+    title_lines: list[str] | None = None,
+    number_headers: set[str] | None = None,
+    trend_type_header: str | None = None,
+    percent_headers: set[str] | None = None,
+    store_type_header: str | None = None,
+    group_headers: bool = False,
+):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
@@ -71,17 +80,105 @@ def _df_to_excel_bytes(df: pd.DataFrame, sheet_name: str, title_lines: list[str]
             c.alignment = Alignment(horizontal="left", vertical="center")
 
     header_row = (len(title_lines) + 2) if title_lines else 1
-    ws.freeze_panes = f"A{header_row + 1}"
 
     header_fill = PatternFill("solid", fgColor="111827")
     header_font = Font(bold=True, color="FFFFFF")
     thin = Side(style="thin", color="D1D5DB")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    headers = []
-    for col in range(1, ws.max_column + 1):
-        v = ws.cell(row=header_row, column=col).value
-        headers.append(str(v) if v is not None else "")
+    def _get_headers(row_idx: int):
+        hs = []
+        for col in range(1, ws.max_column + 1):
+            v = ws.cell(row=row_idx, column=col).value
+            hs.append(str(v) if v is not None else "")
+        return hs
+
+    group_row = None
+    subheader_row = header_row
+    if group_headers:
+        group_row = header_row
+        ws.insert_rows(group_row, amount=1)
+        subheader_row = group_row + 1
+
+    ws.freeze_panes = f"A{subheader_row + 1}"
+
+    headers = _get_headers(subheader_row)
+
+    if group_headers:
+        seg_specs = [
+            ("段粉", "段粉-", "DCFCE7", "166534"),
+            ("雅系列", "雅系列-", "DBEAFE", "1D4ED8"),
+            ("中老年（提）", "中老年-", "FEF9C3", "A16207"),
+        ]
+        grouped_cols: set[int] = set()
+        for label, prefix, bg, fg in seg_specs:
+            idxs = [i + 1 for i, h in enumerate(headers) if str(h).startswith(prefix)]
+            if not idxs:
+                continue
+            idxs = sorted(set(idxs))
+            blocks = []
+            start = idxs[0]
+            prev = idxs[0]
+            for x in idxs[1:]:
+                if x == prev + 1:
+                    prev = x
+                else:
+                    blocks.append((start, prev))
+                    start = x
+                    prev = x
+            blocks.append((start, prev))
+
+            for c1, c2 in blocks:
+                grouped_cols.update(range(c1, c2 + 1))
+                top_cell = ws.cell(row=group_row, column=c1)
+                top_cell.value = label
+                top_cell.fill = PatternFill("solid", fgColor=bg)
+                top_cell.font = Font(bold=True, color=fg)
+                top_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                top_cell.border = border
+                if c2 > c1:
+                    ws.merge_cells(start_row=group_row, start_column=c1, end_row=group_row, end_column=c2)
+
+                for col in range(c1, c2 + 1):
+                    sh = ws.cell(row=subheader_row, column=col)
+                    full = headers[col - 1]
+                    sub = full.split("-", 1)[1] if "-" in full else full
+                    sub = sub.replace("(提)", "").strip()
+                    sh.value = sub
+                    sh.fill = PatternFill("solid", fgColor=bg)
+                    sh.font = Font(bold=True, color=fg)
+                    sh.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                    sh.border = border
+
+        for col in range(1, ws.max_column + 1):
+            if col in grouped_cols:
+                continue
+            v = ws.cell(row=subheader_row, column=col).value
+            c = ws.cell(row=group_row, column=col)
+            c.value = v
+            c.fill = header_fill
+            c.font = header_font
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border = border
+            ws.merge_cells(start_row=group_row, start_column=col, end_row=subheader_row, end_column=col)
+
+        for col in range(1, ws.max_column + 1):
+            c = ws.cell(row=group_row, column=col)
+            if c.value is None:
+                continue
+            c.border = border
+        for col in range(1, ws.max_column + 1):
+            c = ws.cell(row=subheader_row, column=col)
+            if c.value is None:
+                continue
+            c.border = border
+    else:
+        for col in range(1, ws.max_column + 1):
+            c = ws.cell(row=subheader_row, column=col)
+            c.fill = header_fill
+            c.font = header_font
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border = border
 
     trend_col_idx = None
     if trend_type_header:
@@ -90,35 +187,42 @@ def _df_to_excel_bytes(df: pd.DataFrame, sheet_name: str, title_lines: list[str]
         except ValueError:
             trend_col_idx = None
 
-    for col in range(1, ws.max_column + 1):
-        c = ws.cell(row=header_row, column=col)
-        c.fill = header_fill
-        c.font = header_font
-        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        c.border = border
+    store_type_col_idx = None
+    if store_type_header:
+        try:
+            store_type_col_idx = headers.index(store_type_header) + 1
+        except ValueError:
+            store_type_col_idx = None
 
     max_rows_for_full_style = 12000
     apply_full = ws.max_row <= max_rows_for_full_style
-    num_fmt = "#,##0.0"
+    num_fmt = "0.#"
+    pct_fmt = "0.#%"
     number_headers = number_headers or set()
+    percent_headers = percent_headers or set()
 
     even_fill = PatternFill("solid", fgColor="F8FAFC")
-    total_fill = PatternFill("solid", fgColor="FEF9C3")
+    total_fill = None
 
-    for r in range(header_row + 1, ws.max_row + 1):
-        is_total_row = str(ws.cell(row=r, column=1).value or "").strip() == "合计"
+    for r in range(subheader_row + 1, ws.max_row + 1):
+        is_total_row = False
+        for c0 in range(1, min(4, ws.max_column) + 1):
+            if str(ws.cell(row=r, column=c0).value or "").strip() == "合计":
+                is_total_row = True
+                break
         for col in range(1, ws.max_column + 1):
             cell = ws.cell(row=r, column=col)
             cell.alignment = Alignment(horizontal="center", vertical="center")
             if apply_full:
                 cell.border = border
-                if (r - header_row) % 2 == 0:
+                if (r - subheader_row) % 2 == 0:
                     cell.fill = even_fill
                 if is_total_row:
-                    cell.fill = total_fill
-                    cell.font = Font(bold=True, color="111827")
+                    cell.font = Font(bold=True, color="A16207")
             if headers[col - 1] in number_headers:
                 cell.number_format = num_fmt
+            if headers[col - 1] in percent_headers:
+                cell.number_format = pct_fmt
             if trend_col_idx and col == trend_col_idx:
                 v = str(cell.value or "").strip()
                 if v == "持续增长":
@@ -133,6 +237,20 @@ def _df_to_excel_bytes(df: pd.DataFrame, sheet_name: str, title_lines: list[str]
                 elif v == "先增长后下滑":
                     cell.fill = PatternFill("solid", fgColor="FEF9C3")
                     cell.font = Font(bold=True, color="A16207")
+            if store_type_col_idx and col == store_type_col_idx:
+                v = str(cell.value or "").strip().upper()
+                if "A" in v:
+                    cell.fill = PatternFill("solid", fgColor="DCFCE7")
+                    cell.font = Font(bold=True, color="166534")
+                elif "B" in v:
+                    cell.fill = PatternFill("solid", fgColor="DBEAFE")
+                    cell.font = Font(bold=True, color="1D4ED8")
+                elif "C" in v:
+                    cell.fill = PatternFill("solid", fgColor="FEF9C3")
+                    cell.font = Font(bold=True, color="A16207")
+                elif "D" in v:
+                    cell.fill = PatternFill("solid", fgColor="FEE2E2")
+                    cell.font = Font(bold=True, color="991B1B")
 
     for col in range(1, ws.max_column + 1):
         col_letter = get_column_letter(col)
@@ -212,6 +330,11 @@ def _pil_table_png(df: pd.DataFrame, title_lines: list[str], font_size: int = 16
     def _cell_text(v, t):
         if t == "num":
             return fmt_num_fixed(v, decimals=1, na="0")
+        if t == "pct":
+            try:
+                return fmt_pct_ratio(v, na="—", decimals=1)
+            except Exception:
+                return ""
         if v is None:
             return ""
         return str(v)
@@ -302,6 +425,17 @@ def _pil_table_png(df: pd.DataFrame, title_lines: list[str], font_size: int = 16
 
     def _tag_style(tag: str):
         t = (tag or "").strip()
+        m = re.search(r"[A-Da-d]", t)
+        if m:
+            k = m.group(0).upper()
+            if k == "A":
+                return (219, 246, 229), (15, 81, 50)
+            if k == "B":
+                return (219, 234, 254), (30, 64, 175)
+            if k == "C":
+                return (254, 243, 199), (146, 64, 14)
+            if k == "D":
+                return (254, 226, 226), (127, 29, 29)
         if t == "持续增长":
             return (219, 246, 229), (15, 81, 50)
         if t == "持续下滑":
@@ -499,8 +633,8 @@ st.markdown("""
         --tbl-header-bg: #4285F4;
         --tbl-header-bg-hover: #2F76E4;
         --tbl-header-border: #2B63C4;
-        --tbl-header-fg: #FFFFFF;
-        --tbl-header-icon: rgba(255, 255, 255, 0.92);
+        --tbl-header-fg: #A16207;
+        --tbl-header-icon: #A16207;
         --tbl-header-shadow: 0 6px 16px rgba(0, 0, 0, 0.16);
         --tbl-header-font-size: 15px;
         --tbl-header-font-weight: 800;
@@ -512,8 +646,8 @@ st.markdown("""
             --tbl-header-bg: #2B66D9;
             --tbl-header-bg-hover: #2358C2;
             --tbl-header-border: #1B46A0;
-            --tbl-header-fg: #FFFFFF;
-            --tbl-header-icon: rgba(255, 255, 255, 0.95);
+            --tbl-header-fg: #A16207;
+            --tbl-header-icon: #A16207;
             --tbl-header-shadow: 0 10px 22px rgba(0, 0, 0, 0.32);
         }
     }
@@ -936,7 +1070,10 @@ function(params) {
     if (v === null || v === undefined) return '';
     const n = Number(v);
     if (!isFinite(n)) return '';
-    return n.toLocaleString('zh-CN', {minimumFractionDigits: 1, maximumFractionDigits: 1});
+    const isInt = Math.abs(n - Math.round(n)) < 1e-9;
+    const minF = isInt ? 0 : 1;
+    const maxF = isInt ? 0 : 1;
+    return n.toLocaleString('zh-CN', {minimumFractionDigits: minF, maximumFractionDigits: maxF});
 }
 """)
 
@@ -947,7 +1084,10 @@ function(params) {
     const n = Number(v);
     if (!isFinite(n)) return '';
     const p = n * 100;
-    return p.toLocaleString('zh-CN', {minimumFractionDigits: 1, maximumFractionDigits: 1}) + '%';
+    const isInt = Math.abs(p - Math.round(p)) < 1e-9;
+    const minF = isInt ? 0 : 1;
+    const maxF = isInt ? 0 : 1;
+    return p.toLocaleString('zh-CN', {minimumFractionDigits: minF, maximumFractionDigits: maxF}) + '%';
 }
 """)
 
@@ -1119,6 +1259,38 @@ class TrendTagRenderer {
 }
 """)
 
+JS_STORE_TAG = JsCode("""
+class StoreTagRenderer {
+    init(params) {
+        this.eGui = document.createElement('div');
+        this.eGui.style.width = '100%';
+        this.eGui.style.height = '100%';
+        this.eGui.style.display = 'flex';
+        this.eGui.style.alignItems = 'center';
+        this.eGui.style.justifyContent = 'center';
+        const raw = (params.value === null || params.value === undefined) ? '' : String(params.value);
+        const v = raw.trim();
+        let bg = '#f3f4f6';
+        let fg = '#374151';
+        let letter = '';
+        const m = v.match(/[A-D]/i);
+        if (m && m[0]) letter = m[0].toUpperCase();
+        if (letter === 'A') { bg = '#dcfce7'; fg = '#166534'; }
+        else if (letter === 'B') { bg = '#dbeafe'; fg = '#1d4ed8'; }
+        else if (letter === 'C') { bg = '#fef9c3'; fg = '#a16207'; }
+        else if (letter === 'D') { bg = '#fee2e2'; fg = '#991b1b'; }
+        this.eGui.innerHTML = `
+            <span style="display:inline-flex; align-items:center; justify-content:center; padding:2px 10px; border-radius:999px; background:${bg}; color:${fg}; font-size:12px; font-weight:800; border:1px solid rgba(0,0,0,0.06);">
+                ${v || '—'}
+            </span>
+        `;
+    }
+    getGui() {
+        return this.eGui;
+    }
+}
+""")
+
 def show_aggrid_table(df, height=None, key=None, on_row_selected=None, 
                       columns_props=None, 
                       column_defs=None,
@@ -1200,6 +1372,9 @@ def show_aggrid_table(df, height=None, key=None, on_row_selected=None,
             overflow: visible !important;
             text-overflow: clip !important;
             line-height: 1.2 !important;
+        }
+        .ag-header-cell-text {
+            font-size: 12px !important;
         }
 
         /* Strict Centering for Cells */
@@ -2322,21 +2497,79 @@ def load_data_v3(file_bytes: bytes, file_name: str):
         if df_scan_raw is not None:
             df0 = df_scan_raw
 
+            def _pick_scan_sheet(xl_obj: pd.ExcelFile):
+                candidates = [str(s) for s in xl_obj.sheet_names if any(k in str(s) for k in ["扫码", "扫描"])]
+                if not candidates:
+                    return None
+                best = None
+                best_key = -1
+                for sname in candidates:
+                    try:
+                        tmp = xl_obj.parse(sname)
+                        cols = [str(c).strip() for c in tmp.columns]
+                        y_col = next((c for c in cols if c in ["年", "年份"]), None)
+                        m_col = next((c for c in cols if c in ["月", "月份"]), None)
+                        d_col = next((c for c in cols if c in ["日", "天"]), None)
+                        if y_col is None or m_col is None or d_col is None:
+                            continue
+                        yy = pd.to_numeric(tmp[y_col].astype(str).str.extract(r"(\d+)")[0], errors="coerce").fillna(0).astype(int)
+                        yy = yy.apply(lambda v: v + 2000 if 0 < v < 100 else v)
+                        mm = pd.to_numeric(tmp[m_col].astype(str).str.extract(r"(\d+)")[0], errors="coerce").fillna(0).astype(int)
+                        dd = pd.to_numeric(tmp[d_col].astype(str).str.extract(r"(\d+)")[0], errors="coerce").fillna(0).astype(int)
+                        key = (yy * 10000 + mm * 100 + dd).max()
+                        key = int(key) if pd.notna(key) else -1
+                        if key > best_key:
+                            best_key = key
+                            best = sname
+                    except Exception:
+                        continue
+                return best
+
+            try:
+                bio = io.BytesIO(file_bytes)
+                xl2 = pd.ExcelFile(bio)
+                chosen_scan_sheet = _pick_scan_sheet(xl2)
+                if chosen_scan_sheet:
+                    df0 = xl2.parse(chosen_scan_sheet)
+            except Exception:
+                df0 = df_scan_raw
+
+            cols = [str(c).strip() for c in df0.columns]
+            def _col_by_name(names: list[str]):
+                for n in names:
+                    if n in df0.columns:
+                        return n
+                for c in df0.columns:
+                    s = str(c).strip()
+                    if any(n in s for n in names):
+                        return c
+                return None
+
+            store_col = _col_by_name(["门店名称"])
+            dist_col = _col_by_name(["经销商名称", "客户简称"])
+            prov_col = _col_by_name(["省区"])
+            cat_col = _col_by_name(["产品大类", "大类"])
+            small_col = _col_by_name(["产品小类", "产品名称", "重量"])
+            coord_col = _col_by_name(["经纬度", "GPS位置"])
+            y_col = _col_by_name(["年份", "年"])
+            m_col = _col_by_name(["月份", "月"])
+            d_col = _col_by_name(["日"])
+
             def _col(idx: int):
                 if idx < df0.shape[1]:
                     return df0.iloc[:, idx]
                 return pd.Series([None] * len(df0))
 
             df_scan_raw = pd.DataFrame({
-                "门店名称": _col(1),
-                "经销商名称": _col(18),
-                "省区": _col(17),
-                "产品大类": _col(19),
-                "产品小类": _col(20),
-                "经纬度": _col(12),
-                "年份": _col(13),
-                "月份": _col(14),
-                "日": _col(15),
+                "门店名称": df0[store_col] if store_col is not None else _col(1),
+                "经销商名称": df0[dist_col] if dist_col is not None else _col(18),
+                "省区": df0[prov_col] if prov_col is not None else _col(17),
+                "产品大类": df0[cat_col] if cat_col is not None else _col(19),
+                "产品小类": df0[small_col] if small_col is not None else _col(20),
+                "经纬度": df0[coord_col] if coord_col is not None else _col(12),
+                "年份": df0[y_col] if y_col is not None else _col(13),
+                "月份": df0[m_col] if m_col is not None else _col(14),
+                "日": df0[d_col] if d_col is not None else _col(15),
             })
 
             df_scan_raw["年份"] = df_scan_raw["年份"].astype(str).str.extract(r"(\d+)")[0].astype(float).fillna(0).astype(int)
@@ -2521,6 +2754,314 @@ def load_builtin_scan_2025():
 
     df = df[df["年份"] == 2025]
     return df
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_project_targets_sheet(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    try:
+        bio = io.BytesIO(file_bytes)
+        xl = pd.ExcelFile(bio)
+        names = [str(s) for s in xl.sheet_names]
+        preferred = [s for s in names if any(k in s for k in ["专案", "项目", "专案数据"])]
+        candidates = preferred + [s for s in names if s not in preferred]
+
+        def _has_store_type(cols) -> bool:
+            return any("门店类型" in str(c) for c in cols)
+
+        for sname in candidates:
+            try:
+                tmp = xl.parse(sname, nrows=0)
+                cols = [str(c).strip() for c in tmp.columns]
+                if _has_store_type(cols):
+                    df = xl.parse(sname)
+                    df.columns = [str(c).strip() for c in df.columns]
+                    df = df.dropna(how="all")
+                    return df
+            except Exception:
+                continue
+
+        for sname in candidates:
+            try:
+                raw = xl.parse(sname, header=None)
+                if raw is None or raw.empty:
+                    continue
+                header_row = None
+                for r in range(min(80, len(raw))):
+                    row = raw.iloc[r].tolist()
+                    if any("门店类型" in str(x) for x in row if x is not None):
+                        header_row = r
+                        break
+                if header_row is None:
+                    continue
+                cols = [str(c).strip() if c is not None else "" for c in raw.iloc[header_row].tolist()]
+                df = raw.iloc[header_row + 1 :].copy()
+                df.columns = cols
+                df = df.dropna(how="all")
+                return df
+            except Exception:
+                continue
+
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+def _first_col_contains(df: pd.DataFrame, keywords: list[str]):
+    if df is None or df.empty:
+        return None
+    cols = [str(c).strip() for c in df.columns]
+    for c in cols:
+        ok = True
+        for k in keywords:
+            if k not in c:
+                ok = False
+                break
+        if ok:
+            return c
+    return None
+
+def _build_project_tracking_store_df(
+    df_out_base: pd.DataFrame,
+    df_proj_raw: pd.DataFrame,
+    year: int,
+    month: int | None,
+):
+    if df_out_base is None or df_out_base.empty:
+        return pd.DataFrame(), ["未检测到出库数据"]
+    if df_proj_raw is None or df_proj_raw.empty:
+        return pd.DataFrame(), ["未检测到专案数据（请确认第7个sheet包含“门店类型”列）"]
+
+    df_proj = df_proj_raw.copy()
+    df_proj.columns = [str(c).strip() for c in df_proj.columns]
+
+    prov_col = _first_col_contains(df_proj, ["省区"]) or _first_col_contains(df_proj, ["省区名称"])
+    dist_col = _first_col_contains(df_proj, ["经销商"]) or _first_col_contains(df_proj, ["客户简称"]) or _first_col_contains(df_proj, ["客户"])
+    store_type_col = _first_col_contains(df_proj, ["门店类型"])
+    store_col = None
+    for c in df_proj.columns:
+        s = str(c)
+        if ("门店" in s) and ("门店类型" not in s) and ("编码" not in s):
+            store_col = c
+            break
+
+    if store_type_col is None and len(df_proj.columns) > 4:
+        store_type_col = df_proj.columns[4]
+
+    logs = []
+    missing = []
+    for k, v in [("省区", prov_col), ("经销商", dist_col), ("门店", store_col), ("门店类型", store_type_col)]:
+        if v is None:
+            missing.append(k)
+    if missing:
+        return pd.DataFrame(), [f"专案数据缺少关键列：{', '.join(missing)}"]
+
+    seg_map = {"美思雅段粉": "段粉", "雅系列": "雅系列", "中老年": "中老年"}
+
+    seg_target_candidates = {
+        "段粉": [
+            _first_col_contains(df_proj, ["段粉", "目标"]),
+            _first_col_contains(df_proj, ["段粉", "任务"]),
+            _first_col_contains(df_proj, ["段粉"]),
+        ],
+        "雅系列": [
+            _first_col_contains(df_proj, ["雅系列", "目标"]),
+            _first_col_contains(df_proj, ["雅系列", "任务"]),
+            _first_col_contains(df_proj, ["雅系列"]),
+        ],
+        "中老年": [
+            _first_col_contains(df_proj, ["中老年", "目标"]),
+            _first_col_contains(df_proj, ["中老年", "任务"]),
+            _first_col_contains(df_proj, ["中老年"]),
+        ],
+    }
+    seg_target_col = {k: next((c for c in v if c), None) for k, v in seg_target_candidates.items()}
+
+    if any(seg_target_col[k] is None for k in ["段粉", "雅系列", "中老年"]):
+        miss2 = [k for k in ["段粉", "雅系列", "中老年"] if seg_target_col[k] is None]
+        return pd.DataFrame(), [f"专案数据未找到目标列：{', '.join(miss2)}（请确保列名含“段粉/雅系列/中老年”）"]
+
+    mid_target_is_ti = "提" in str(seg_target_col["中老年"])
+
+    df_tgt = df_proj[[prov_col, dist_col, store_col, store_type_col, seg_target_col["段粉"], seg_target_col["雅系列"], seg_target_col["中老年"]]].copy()
+    df_tgt.columns = ["省区", "经销商名称", "门店名称", "门店类型", "段粉_目标", "雅系列_目标", "中老年_目标"]
+    for c in ["省区", "经销商名称", "门店名称", "门店类型"]:
+        df_tgt[c] = df_tgt[c].fillna("").astype(str).str.strip()
+        if c in ("经销商名称", "门店名称"):
+            df_tgt[c] = df_tgt[c].str.replace(r"\s+", "", regex=True)
+    for c in ["段粉_目标", "雅系列_目标", "中老年_目标"]:
+        df_tgt[c] = pd.to_numeric(df_tgt[c], errors="coerce").fillna(0.0)
+    if not mid_target_is_ti:
+        df_tgt["中老年_目标"] = df_tgt["中老年_目标"] * 3.0
+
+    df_out_all = df_out_base.copy()
+    if "_年" in df_out_all.columns:
+        df_out_all = df_out_all[df_out_all["_年"].astype(int) == int(year)].copy()
+
+    cat_col = "产品大类" if "产品大类" in df_out_all.columns else ("_模块大类" if "_模块大类" in df_out_all.columns else None)
+    if cat_col is None:
+        return pd.DataFrame(), ["出库数据缺少“大类/产品大类”字段"]
+
+    weight_col = None
+    if "重量" in df_out_all.columns:
+        weight_col = "重量"
+    elif "产品小类" in df_out_all.columns:
+        weight_col = "产品小类"
+    elif "_模块小类" in df_out_all.columns:
+        weight_col = "_模块小类"
+
+    if "_门店名" not in df_out_all.columns:
+        store_name_col = None
+        for c in df_out_all.columns:
+            if "门店" in str(c) and "类型" not in str(c):
+                store_name_col = c
+                break
+        if store_name_col:
+            df_out_all["_门店名"] = df_out_all[store_name_col].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+        else:
+            df_out_all["_门店名"] = pd.NA
+
+    for c in ["省区", "经销商名称", "_门店名", cat_col]:
+        if c in df_out_all.columns:
+            df_out_all[c] = df_out_all[c].fillna("").astype(str).str.strip()
+    if "经销商名称" in df_out_all.columns:
+        df_out_all["经销商名称"] = df_out_all["经销商名称"].astype(str).str.replace(r"\s+", "", regex=True)
+    if "_门店名" in df_out_all.columns:
+        df_out_all["_门店名"] = df_out_all["_门店名"].astype(str).str.replace(r"\s+", "", regex=True)
+    if weight_col is not None and weight_col in df_out_all.columns:
+        df_out_all[weight_col] = df_out_all[weight_col].fillna("").astype(str).str.strip()
+
+    proj_dists = sorted([x for x in df_tgt["经销商名称"].dropna().astype(str).unique().tolist() if x and x.lower() not in ("nan", "none", "null")])
+    if proj_dists:
+        df_out_all = df_out_all[df_out_all["经销商名称"].astype(str).isin(proj_dists)].copy()
+
+    df_today_base = df_out_all.copy()
+    try:
+        df_today_base = df_today_base[df_today_base[cat_col].astype(str).isin(list(seg_map.keys()))].copy()
+        if weight_col is not None and weight_col in df_today_base.columns:
+            w_digits = df_today_base[weight_col].astype(str).str.extract(r"(\d+)")[0].fillna("")
+            is_800 = w_digits.astype(str).eq("800")
+            df_today_base = df_today_base[~((df_today_base[cat_col].astype(str) == "美思雅段粉") & (~is_800))].copy()
+    except Exception:
+        df_today_base = df_out_all.copy()
+
+    today_m, today_d = None, None
+    if {"_年", "_月", "_日"}.issubset(set(df_today_base.columns)):
+        try:
+            yy = pd.to_numeric(df_today_base["_年"], errors="coerce").fillna(0).astype(int)
+            mm = pd.to_numeric(df_today_base["_月"], errors="coerce")
+            dd = pd.to_numeric(df_today_base["_日"], errors="coerce")
+            tmp = pd.DataFrame({"_年": yy, "_月": mm, "_日": dd})
+            tmp = tmp[(tmp["_年"] == int(year)) & tmp["_月"].between(1, 12) & tmp["_日"].between(1, 31)]
+            if not tmp.empty:
+                key = (tmp["_年"].astype(int) * 10000 + tmp["_月"].astype(int) * 100 + tmp["_日"].astype(int)).max()
+                key = int(key)
+                today_m = int((key % 10000) // 100)
+                today_d = int(key % 100)
+        except Exception:
+            today_m, today_d = None, None
+    if today_m is not None and today_d is not None:
+        logs.append(f"今日出库日期：{today_m:02d}-{today_d:02d}")
+
+    df_out = df_out_all.copy()
+    if month is not None and "_月" in df_out.columns:
+        df_out = df_out[df_out["_月"].astype(int) == int(month)].copy()
+    df_out_today = df_today_base.copy()
+    if today_m is not None and today_d is not None and {"_月", "_日"}.issubset(set(df_out_today.columns)):
+        df_out_today = df_out_today[
+            (pd.to_numeric(df_out_today["_月"], errors="coerce").astype("Int64") == int(today_m))
+            & (pd.to_numeric(df_out_today["_日"], errors="coerce").astype("Int64") == int(today_d))
+        ].copy()
+    else:
+        df_out_today = df_out_today.iloc[0:0].copy()
+
+    def _prep_out(df_in: pd.DataFrame) -> pd.DataFrame:
+        if df_in is None or df_in.empty:
+            return df_in.iloc[0:0].copy()
+        d = df_in.copy()
+        d = d[d[cat_col].astype(str).isin(list(seg_map.keys()))].copy()
+        if weight_col is not None and weight_col in d.columns:
+            w_digits = d[weight_col].astype(str).str.extract(r"(\d+)")[0].fillna("")
+            is_800 = w_digits.astype(str).eq("800")
+            d = d[~((d[cat_col].astype(str) == "美思雅段粉") & (~is_800))].copy()
+        d["数量(箱)"] = pd.to_numeric(d.get("数量(箱)", 0.0), errors="coerce").fillna(0.0)
+        d["_seg"] = d[cat_col].map(seg_map).fillna("")
+        return d
+
+    df_out = _prep_out(df_out)
+    df_out_today = _prep_out(df_out_today)
+
+    agg_out = (
+        df_out.groupby(["省区", "经销商名称", "_门店名", "_seg"], as_index=False)["数量(箱)"]
+        .sum()
+        .rename(columns={"_门店名": "门店名称"})
+    )
+    agg_out.loc[agg_out["_seg"] == "中老年", "数量(箱)"] = agg_out.loc[agg_out["_seg"] == "中老年", "数量(箱)"] * 3.0
+
+    out_pv = agg_out.pivot_table(index=["省区", "经销商名称", "门店名称"], columns="_seg", values="数量(箱)", aggfunc="sum").fillna(0.0).reset_index()
+    for seg in ["段粉", "雅系列", "中老年"]:
+        if seg not in out_pv.columns:
+            out_pv[seg] = 0.0
+    out_pv = out_pv.rename(columns={"段粉": "段粉_出库", "雅系列": "雅系列_出库", "中老年": "中老年_出库"})
+
+    agg_today = (
+        df_out_today.groupby(["省区", "经销商名称", "_门店名", "_seg"], as_index=False)["数量(箱)"]
+        .sum()
+        .rename(columns={"_门店名": "门店名称"})
+    )
+    agg_today.loc[agg_today["_seg"] == "中老年", "数量(箱)"] = agg_today.loc[agg_today["_seg"] == "中老年", "数量(箱)"] * 3.0
+    today_pv = agg_today.pivot_table(index=["省区", "经销商名称", "门店名称"], columns="_seg", values="数量(箱)", aggfunc="sum").fillna(0.0).reset_index()
+    for seg in ["段粉", "雅系列", "中老年"]:
+        if seg not in today_pv.columns:
+            today_pv[seg] = 0.0
+    today_pv = today_pv.rename(columns={"段粉": "段粉_今日出库", "雅系列": "雅系列_今日出库", "中老年": "中老年_今日出库"})
+
+    store_df = df_tgt.merge(out_pv, on=["省区", "经销商名称", "门店名称"], how="left")
+    store_df = store_df.merge(today_pv, on=["省区", "经销商名称", "门店名称"], how="left")
+    for c in ["段粉_出库", "雅系列_出库", "中老年_出库", "段粉_今日出库", "雅系列_今日出库", "中老年_今日出库"]:
+        store_df[c] = pd.to_numeric(store_df.get(c, 0.0), errors="coerce").fillna(0.0)
+
+    def _rate(out_v, tgt_v):
+        try:
+            t = float(tgt_v or 0.0)
+            if t <= 0:
+                return None
+            return float(out_v or 0.0) / t
+        except Exception:
+            return None
+
+    store_df["段粉-目标值"] = store_df["段粉_目标"].astype(float)
+    store_df["段粉-出库值"] = store_df["段粉_出库"].astype(float)
+    store_df["段粉-完成率"] = store_df.apply(lambda r: _rate(r["段粉-出库值"], r["段粉-目标值"]), axis=1)
+    store_df["段粉-今日出库"] = store_df["段粉_今日出库"].astype(float)
+
+    store_df["雅系列-目标值"] = store_df["雅系列_目标"].astype(float)
+    store_df["雅系列-出库值"] = store_df["雅系列_出库"].astype(float)
+    store_df["雅系列-完成率"] = store_df.apply(lambda r: _rate(r["雅系列-出库值"], r["雅系列-目标值"]), axis=1)
+    store_df["雅系列-今日出库"] = store_df["雅系列_今日出库"].astype(float)
+
+    store_df["中老年-目标值(提)"] = store_df["中老年_目标"].astype(float)
+    store_df["中老年-出库值(提)"] = store_df["中老年_出库"].astype(float)
+    store_df["中老年-完成率"] = store_df.apply(lambda r: _rate(r["中老年-出库值(提)"], r["中老年-目标值(提)"]), axis=1)
+    store_df["中老年-今日出库(提)"] = store_df["中老年_今日出库"].astype(float)
+
+    keep = [
+        "省区",
+        "经销商名称",
+        "门店名称",
+        "门店类型",
+        "段粉-目标值",
+        "段粉-出库值",
+        "段粉-完成率",
+        "段粉-今日出库",
+        "雅系列-目标值",
+        "雅系列-出库值",
+        "雅系列-完成率",
+        "雅系列-今日出库",
+        "中老年-目标值(提)",
+        "中老年-出库值(提)",
+        "中老年-完成率",
+        "中老年-今日出库(提)",
+    ]
+    store_df = store_df[keep].copy()
+    return store_df, logs
 
 # -----------------------------------------------------------------------------
 # 4. Layout
@@ -5087,7 +5628,7 @@ if uploaded_file:
                             return ""
                         return "↑" if x > 0 else ("↓" if x < 0 else "")
 
-                    out_subtab_options = ["📊 关键指标", "📦 分品类", "🗺️ 分省区", "📈 趋势分析"]
+                    out_subtab_options = ["📊 关键指标", "📦 分品类", "🗺️ 分省区", "📈 趋势分析", "🧾 专案追踪"]
                     out_subtab = st.segmented_control(
                         "出库子导航",
                         options=out_subtab_options,
@@ -5713,6 +6254,11 @@ if uploaded_file:
                                 else:
                                     pv[avg_col] = 0.0
 
+                                diff_col = "距月均差额"
+                                feb_col = ym_to_label.get(202602)
+                                if feb_col and (feb_col in pv.columns) and (avg_col in pv.columns):
+                                    pv[diff_col] = pd.to_numeric(pv[feb_col], errors="coerce").fillna(0.0) - pd.to_numeric(pv[avg_col], errors="coerce").fillna(0.0)
+
                                 trend_base_cols = first3_cols if len(first3_cols) >= 1 else sel_month_cols
                                 spark_vals = pv[trend_base_cols].values.tolist() if trend_base_cols else [[] for _ in range(len(pv))]
                                 pv["_趋势数据"] = [json.dumps([float(x) for x in row]) for row in spark_vals]
@@ -5772,6 +6318,17 @@ if uploaded_file:
                                     export_cols.append("趋势类型")
                                 if last_col and (last_col in pv.columns) and (last_col not in export_cols):
                                     export_cols.append(last_col)
+                                if diff_col in pv.columns:
+                                    feb_col = ym_to_label.get(202602)
+                                    insert_after = None
+                                    if feb_col and feb_col in export_cols:
+                                        insert_after = feb_col
+                                    elif last_col and last_col in export_cols:
+                                        insert_after = last_col
+                                    if insert_after:
+                                        idx = export_cols.index(insert_after) + 1
+                                        if diff_col not in export_cols:
+                                            export_cols.insert(idx, diff_col)
                                 if "合计" in pv.columns:
                                     export_cols.append("合计")
 
@@ -5815,6 +6372,8 @@ if uploaded_file:
                                         col_types[c] = "num"
                                 if avg_col in df_export.columns:
                                     col_types[avg_col] = "num"
+                                if diff_col in df_export.columns:
+                                    col_types[diff_col] = "num"
                                 if last_col and last_col in df_export.columns:
                                     col_types[last_col] = "num"
                                 if "合计" in df_export.columns:
@@ -5836,6 +6395,8 @@ if uploaded_file:
                                     cols += [c for c in first3_cols if c in pv.columns]
                                     if avg_col in pv.columns:
                                         cols.append(avg_col)
+                                    if diff_col in pv.columns:
+                                        cols.append(diff_col)
                                     if "趋势类型" in pv.columns:
                                         cols.append("趋势类型")
                                     if last_col and (last_col in pv.columns) and (last_col not in cols):
@@ -5845,6 +6406,13 @@ if uploaded_file:
                                     df_x = pv[cols].copy() if cols else pv.copy()
                                     if avg_col in df_x.columns:
                                         df_x.rename(columns={avg_col: avg_header}, inplace=True)
+                                    if diff_col in df_x.columns:
+                                        feb = ym_to_label.get(202602)
+                                        if feb and feb in df_x.columns:
+                                            ordered_cols = [c for c in df_x.columns if c != diff_col]
+                                            idx = ordered_cols.index(feb) + 1
+                                            ordered_cols.insert(idx, diff_col)
+                                            df_x = df_x[ordered_cols].copy()
 
                                     months = [c for c in first3_cols if c in df_x.columns]
                                     if last_col and last_col in df_x.columns and last_col not in months:
@@ -5877,6 +6445,13 @@ if uploaded_file:
                                     ordered = [c for c in ordered if c in df_x.columns]
                                     if ordered:
                                         df_x = df_x[ordered].copy()
+                                    if diff_col in df_x.columns:
+                                        feb = ym_to_label.get(202602)
+                                        if feb and feb in df_x.columns:
+                                            ordered_cols = [c for c in df_x.columns if c != diff_col]
+                                            idx = ordered_cols.index(feb) + 1
+                                            ordered_cols.insert(idx, diff_col)
+                                            df_x = df_x[ordered_cols].copy()
                                     return df_x
 
                                 def _build_store_detail_df(all_provinces: bool):
@@ -5938,6 +6513,10 @@ if uploaded_file:
                                         pv_s["趋势类型"] = pv_s.apply(lambda r: _trend_tag(r[tcols[0]], r[tcols[1]], r[tcols[2]]), axis=1)
                                     else:
                                         pv_s["趋势类型"] = "—"
+                                    if "距月均差额" not in pv_s.columns:
+                                        feb = ym_to_label.get(202602)
+                                        if feb and feb in pv_s.columns and avg_header in pv_s.columns:
+                                            pv_s["距月均差额"] = pd.to_numeric(pv_s[feb], errors="coerce").fillna(0.0) - pd.to_numeric(pv_s[avg_header], errors="coerce").fillna(0.0)
 
                                     months = [c for c in sel_month_cols if c in pv_s.columns]
                                     anchor = tcols[-1] if tcols else (months[-1] if months else None)
@@ -5953,6 +6532,10 @@ if uploaded_file:
                                     ordered = ["省区", "经销商", "门店"]
                                     ordered += before
                                     ordered.append(avg_header)
+                                    if "距月均差额" in pv_s.columns:
+                                        feb = ym_to_label.get(202602)
+                                        if feb and feb in ordered:
+                                            ordered.insert(ordered.index(feb) + 1, "距月均差额")
                                     ordered.append("趋势类型")
                                     ordered += after
                                     ordered.append("合计")
@@ -5961,7 +6544,7 @@ if uploaded_file:
                                     return pv_s
 
                                 number_headers_current = set([c for c in first3_cols if c in pv.columns])
-                                number_headers_current |= {avg_header, last_col or "", "合计"}
+                                number_headers_current |= {avg_header, last_col or "", "合计", "距月均差额"}
                                 number_headers_current.discard("")
 
                                 if "out_m_excel_cache" not in st.session_state:
@@ -6031,7 +6614,7 @@ if uploaded_file:
                                                     "区域：全部省区（省区→经销商→门店）",
                                                     f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                                                 ]
-                                                number_headers_all = set(sel_month_cols + [avg_header, "合计"])
+                                                number_headers_all = set(sel_month_cols + [avg_header, "距月均差额", "合计"])
                                                 xlsx_all = _df_to_excel_bytes(
                                                     df_all,
                                                     sheet_name="趋势分析",
@@ -6065,7 +6648,7 @@ if uploaded_file:
                                                     area_line,
                                                     f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                                                 ]
-                                                number_headers_detail = set(sel_month_cols + [avg_header, "合计"])
+                                                number_headers_detail = set(sel_month_cols + [avg_header, "距月均差额", "合计"])
                                                 xlsx_detail = _df_to_excel_bytes(
                                                     df_detail,
                                                     sheet_name="趋势分析",
@@ -6180,6 +6763,9 @@ if uploaded_file:
                                     pv2["合计"] = pv2.sum(axis=1)
                                     pv2 = pv2.sort_values("合计", ascending=False).reset_index()
                                     pv2[avg_col] = pv2[first3_cols].mean(axis=1) if len(first3_cols) >= 1 else 0.0
+                                    feb = ym_to_label.get(202602)
+                                    if feb and feb in pv2.columns:
+                                        pv2["距月均差额"] = pd.to_numeric(pv2[feb], errors="coerce").fillna(0.0) - pd.to_numeric(pv2[avg_col], errors="coerce").fillna(0.0)
                                     spark_vals2 = pv2[trend_base_cols].values.tolist() if trend_base_cols else [[] for _ in range(len(pv2))]
                                     pv2["_趋势数据"] = [json.dumps([float(x) for x in row]) for row in spark_vals2]
                                     pv2["趋势"] = pv2["_趋势数据"]
@@ -6330,6 +6916,22 @@ if uploaded_file:
                                     {"headerName": "_趋势数据", "field": "_趋势数据", "hide": True},
                                 ]
                                 col_defs = [col_defs[0], *month_first3_defs, *col_defs[1:]]
+                                if "距月均差额" in pv.columns:
+                                    feb_col = ym_to_label.get(202602)
+                                    if feb_col and feb_col in pv.columns:
+                                        for i, cd in enumerate(col_defs):
+                                            if cd.get("field") == feb_col:
+                                                col_defs.insert(
+                                                    i + 1,
+                                                    {
+                                                        "headerName": "距月均差额",
+                                                        "field": "距月均差额",
+                                                        "type": ["numericColumn", "numberColumnFilter"],
+                                                        "valueFormatter": JS_FMT_NUM,
+                                                        "width": 140,
+                                                    },
+                                                )
+                                                break
 
                                 pinned_total = {view_dim: "合计"}
                                 try:
@@ -6341,6 +6943,8 @@ if uploaded_file:
                                         _num_cols.append(avg_col)
                                     if last_col and last_col in pv.columns:
                                         _num_cols.append(last_col)
+                                    if "距月均差额" in pv.columns:
+                                        _num_cols.append("距月均差额")
                                     if "合计" in pv.columns:
                                         _num_cols.append("合计")
                                     for _c in _num_cols:
@@ -6427,6 +7031,578 @@ if uploaded_file:
                                         st.session_state.out_m_selected_dist = selected_name
                                         st.session_state.out_m_drill_level = 3
                                         st.rerun()
+
+                    if out_subtab == "🧾 专案追踪":
+                        st.markdown("### 🧾 专案经销商出库追踪（段粉 / 雅系列 / 中老年）")
+                        st.caption("口径：只统计2026年；出库值取出库底表S列“箱”；中老年按 提=箱×3；目标取第7个sheet（专案数据）门店目标；门店类型取专案数据E列。")
+
+                        if "proj_view_mode" not in st.session_state:
+                            st.session_state.proj_view_mode = "经销商列表"
+                        if "proj_drill_level" not in st.session_state:
+                            st.session_state.proj_drill_level = 1
+                        if "proj_selected_prov" not in st.session_state:
+                            st.session_state.proj_selected_prov = None
+                        if "proj_selected_dist" not in st.session_state:
+                            st.session_state.proj_selected_dist = None
+
+                        mode = st.segmented_control(
+                            "专案追踪视图",
+                            options=["经销商列表", "省区汇总"],
+                            key="proj_view_mode",
+                            label_visibility="collapsed",
+                        )
+                        prev_mode = st.session_state.get("_proj_view_mode_prev")
+                        if prev_mode != mode:
+                            if mode == "经销商列表":
+                                st.session_state.proj_drill_level = 2
+                                st.session_state.proj_selected_prov = None
+                                st.session_state.proj_selected_dist = None
+                            else:
+                                st.session_state.proj_drill_level = 1
+                                st.session_state.proj_selected_prov = None
+                                st.session_state.proj_selected_dist = None
+                            st.session_state["_proj_view_mode_prev"] = mode
+
+                        df_proj_raw = load_project_targets_sheet(cached_bytes, uploaded_name)
+                        tgt_month = None if str(o_month) == "全部" else int(o_month)
+                        proj_year = 2026
+                        store_df, proj_logs = _build_project_tracking_store_df(o_raw, df_proj_raw, int(proj_year), tgt_month)
+                        today_mmdd = ""
+                        for x in (proj_logs or []):
+                            s = str(x).strip()
+                            if s.startswith("今日出库日期："):
+                                today_mmdd = s.replace("今日出库日期：", "").strip()
+                                break
+
+                        if store_df is None or store_df.empty:
+                            st.warning("暂无可展示的专案追踪数据")
+                            with st.expander("🛠️ 调试信息", expanded=False):
+                                for x in (proj_logs or []):
+                                    st.text(str(x))
+                        else:
+                            cnav = st.columns([1, 8])
+                            if int(st.session_state.proj_drill_level) > 1:
+                                if cnav[0].button("⬅️ 返回", key="proj_back_btn"):
+                                    st.session_state.proj_drill_level = int(st.session_state.proj_drill_level) - 1
+                                    if mode == "经销商列表":
+                                        if int(st.session_state.proj_drill_level) <= 2:
+                                            st.session_state.proj_drill_level = 2
+                                            st.session_state.proj_selected_prov = None
+                                            st.session_state.proj_selected_dist = None
+                                    else:
+                                        if int(st.session_state.proj_drill_level) == 1:
+                                            st.session_state.proj_selected_prov = None
+                                            st.session_state.proj_selected_dist = None
+                                        elif int(st.session_state.proj_drill_level) == 2:
+                                            st.session_state.proj_selected_dist = None
+                                    st.rerun()
+
+                            bread = "🏠 全部省区"
+                            if int(st.session_state.proj_drill_level) >= 2 and st.session_state.proj_selected_prov:
+                                bread += f" > 📍 {st.session_state.proj_selected_prov}"
+                            if int(st.session_state.proj_drill_level) >= 3 and st.session_state.proj_selected_dist:
+                                bread += f" > 🏢 {st.session_state.proj_selected_dist}"
+                            cnav[1].markdown(f"**当前位置**: {bread}")
+
+                            def _agg(df_in: pd.DataFrame, group_col: str):
+                                seg_cols = [
+                                    "段粉-目标值",
+                                    "段粉-出库值",
+                                    "段粉-今日出库",
+                                    "雅系列-目标值",
+                                    "雅系列-出库值",
+                                    "雅系列-今日出库",
+                                    "中老年-目标值(提)",
+                                    "中老年-出库值(提)",
+                                    "中老年-今日出库(提)",
+                                ]
+                                seg_cols = [c for c in seg_cols if c in df_in.columns]
+                                g = df_in.groupby(group_col, as_index=False)[seg_cols].sum()
+                                if "段粉-目标值" in g.columns and "段粉-出库值" in g.columns:
+                                    g["段粉-完成率"] = np.where(g["段粉-目标值"] > 0, g["段粉-出库值"] / g["段粉-目标值"], None)
+                                if "雅系列-目标值" in g.columns and "雅系列-出库值" in g.columns:
+                                    g["雅系列-完成率"] = np.where(g["雅系列-目标值"] > 0, g["雅系列-出库值"] / g["雅系列-目标值"], None)
+                                if "中老年-目标值(提)" in g.columns and "中老年-出库值(提)" in g.columns:
+                                    g["中老年-完成率"] = np.where(g["中老年-目标值(提)"] > 0, g["中老年-出库值(提)"] / g["中老年-目标值(提)"], None)
+                                ordered = [
+                                    group_col,
+                                    "段粉-目标值",
+                                    "段粉-出库值",
+                                    "段粉-完成率",
+                                    "段粉-今日出库",
+                                    "雅系列-目标值",
+                                    "雅系列-出库值",
+                                    "雅系列-完成率",
+                                    "雅系列-今日出库",
+                                    "中老年-目标值(提)",
+                                    "中老年-出库值(提)",
+                                    "中老年-完成率",
+                                    "中老年-今日出库(提)",
+                                ]
+                                ordered = [c for c in ordered if c in g.columns]
+                                rest = [c for c in g.columns if c not in ordered]
+                                return g[ordered + rest]
+
+                            drill_level = int(st.session_state.proj_drill_level)
+                            view_df = None
+                            view_dim = "省区"
+                            if mode == "经销商列表":
+                                if drill_level < 2:
+                                    drill_level = 2
+                                    st.session_state.proj_drill_level = 2
+                                if drill_level == 2:
+                                    view_df = _agg(store_df, "经销商名称").sort_values(["段粉-完成率", "雅系列-完成率", "中老年-完成率"], ascending=False)
+                                    prov_map = (
+                                        store_df[["经销商名称", "省区"]]
+                                        .dropna()
+                                        .astype(str)
+                                        .drop_duplicates()
+                                        .groupby("经销商名称")["省区"]
+                                        .agg(lambda x: ",".join(sorted([t for t in x if t.strip()])))
+                                        .reset_index()
+                                    )
+                                    view_df = view_df.merge(prov_map, on="经销商名称", how="left")
+                                    cols_front = ["省区", "经销商名称"]
+                                    cols_rest = [c for c in view_df.columns if c not in cols_front]
+                                    view_df = view_df[cols_front + cols_rest]
+                                    view_dim = "经销商名称"
+                                else:
+                                    d = str(st.session_state.proj_selected_dist or "").strip().replace(" ", "")
+                                    p = str(st.session_state.proj_selected_prov or "").strip()
+                                    df_s = store_df.copy()
+                                    if d:
+                                        df_s = df_s[df_s["经销商名称"].astype(str).str.replace(r"\s+", "", regex=True) == d].copy()
+                                    if p:
+                                        df_s = df_s[df_s["省区"].astype(str).str.strip() == p].copy()
+                                    view_df = df_s.sort_values(["段粉-完成率", "雅系列-完成率", "中老年-完成率"], ascending=False).reset_index(drop=True)
+                                    view_dim = "门店名称"
+                            else:
+                                if drill_level == 1:
+                                    view_df = _agg(store_df, "省区").sort_values(["段粉-完成率", "雅系列-完成率", "中老年-完成率"], ascending=False)
+                                    view_dim = "省区"
+                                elif drill_level == 2:
+                                    p = str(st.session_state.proj_selected_prov or "").strip()
+                                    df_p = store_df[store_df["省区"].astype(str) == p].copy() if p else store_df.copy()
+                                    view_df = _agg(df_p, "经销商名称").sort_values(["段粉-完成率", "雅系列-完成率", "中老年-完成率"], ascending=False)
+                                    view_dim = "经销商名称"
+                                else:
+                                    p = str(st.session_state.proj_selected_prov or "").strip()
+                                    d = str(st.session_state.proj_selected_dist or "").strip().replace(" ", "")
+                                    df_s = store_df.copy()
+                                    if p:
+                                        df_s = df_s[df_s["省区"].astype(str).str.strip() == p].copy()
+                                    if d:
+                                        df_s = df_s[df_s["经销商名称"].astype(str).str.replace(r"\s+", "", regex=True) == d].copy()
+                                    view_df = df_s.sort_values(["段粉-完成率", "雅系列-完成率", "中老年-完成率"], ascending=False).reset_index(drop=True)
+                                    view_dim = "门店名称"
+
+                            view_df = view_df.replace({np.nan: None})
+
+                            def _total_row_from_df(df_in: pd.DataFrame, first_label: str):
+                                def _sum_col(col: str) -> float:
+                                    if col not in df_in.columns:
+                                        return 0.0
+                                    return float(pd.to_numeric(df_in[col], errors="coerce").fillna(0).sum())
+
+                                t1 = _sum_col("段粉-目标值")
+                                o1 = _sum_col("段粉-出库值")
+                                td1 = _sum_col("段粉-今日出库")
+                                t2 = _sum_col("雅系列-目标值")
+                                o2 = _sum_col("雅系列-出库值")
+                                td2 = _sum_col("雅系列-今日出库")
+                                t3 = _sum_col("中老年-目标值(提)")
+                                o3 = _sum_col("中老年-出库值(提)")
+                                td3 = _sum_col("中老年-今日出库(提)")
+                                r1 = (o1 / t1) if t1 > 0 else None
+                                r2 = (o2 / t2) if t2 > 0 else None
+                                r3 = (o3 / t3) if t3 > 0 else None
+                                row = {
+                                    view_dim: first_label,
+                                    "段粉-目标值": t1,
+                                    "段粉-出库值": o1,
+                                    "段粉-完成率": r1,
+                                    "段粉-今日出库": td1,
+                                    "雅系列-目标值": t2,
+                                    "雅系列-出库值": o2,
+                                    "雅系列-完成率": r2,
+                                    "雅系列-今日出库": td2,
+                                    "中老年-目标值(提)": t3,
+                                    "中老年-出库值(提)": o3,
+                                    "中老年-完成率": r3,
+                                    "中老年-今日出库(提)": td3,
+                                }
+                                if "省区" in df_in.columns and view_dim != "省区":
+                                    row["省区"] = ""
+                                if "门店类型" in df_in.columns:
+                                    row["门店类型"] = ""
+                                return row
+
+                            col_defs = [
+                                {"headerName": view_dim, "field": view_dim, "pinned": "left", "minWidth": 220, "tooltipField": view_dim},
+                            ]
+                            if mode == "经销商列表" and drill_level == 2:
+                                col_defs = [
+                                    {"headerName": "省区", "field": "省区", "pinned": "left", "minWidth": 140, "tooltipField": "省区"},
+                                    {"headerName": "经销商名称", "field": "经销商名称", "pinned": "left", "minWidth": 220, "tooltipField": "经销商名称"},
+                                ]
+                            if drill_level == 3:
+                                front = []
+                                if "省区" in view_df.columns:
+                                    front.append({"headerName": "省区", "field": "省区", "pinned": "left", "minWidth": 140, "tooltipField": "省区"})
+                                front.append({"headerName": "门店名称", "field": "门店名称", "pinned": "left", "minWidth": 240, "tooltipField": "门店名称"})
+                                if "门店类型" in view_df.columns:
+                                    front.append({"headerName": "门店类型", "field": "门店类型", "pinned": "left", "minWidth": 120, "tooltipField": "门店类型", "cellRenderer": JS_STORE_TAG})
+                                col_defs = front
+                            col_defs += [
+                                {
+                                    "headerName": "段粉",
+                                    "children": [
+                                        {"headerName": "目标值", "field": "段粉-目标值", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 110},
+                                        {"headerName": "出库值", "field": "段粉-出库值", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 110},
+                                        {"headerName": "完成率", "field": "段粉-完成率", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_PCT_RATIO, "width": 110},
+                                        {"headerName": ("今日出库\\n" + today_mmdd) if today_mmdd else "今日出库", "field": "段粉-今日出库", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 120},
+                                    ],
+                                },
+                                {
+                                    "headerName": "雅系列",
+                                    "children": [
+                                        {"headerName": "目标值", "field": "雅系列-目标值", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 110},
+                                        {"headerName": "出库值", "field": "雅系列-出库值", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 110},
+                                        {"headerName": "完成率", "field": "雅系列-完成率", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_PCT_RATIO, "width": 110},
+                                        {"headerName": ("今日出库\\n" + today_mmdd) if today_mmdd else "今日出库", "field": "雅系列-今日出库", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 120},
+                                    ],
+                                },
+                                {
+                                    "headerName": "中老年（提）",
+                                    "children": [
+                                        {"headerName": "目标值", "field": "中老年-目标值(提)", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 130},
+                                        {"headerName": "出库值", "field": "中老年-出库值(提)", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 130},
+                                        {"headerName": "完成率", "field": "中老年-完成率", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_PCT_RATIO, "width": 110},
+                                        {"headerName": ("今日出库\\n" + today_mmdd) if today_mmdd else "今日出库", "field": "中老年-今日出库(提)", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 120},
+                                    ],
+                                },
+                            ]
+
+                            total_row = _total_row_from_df(view_df, "合计")
+                            grid_overrides = {
+                                "pinnedBottomRowData": [total_row],
+                                "getRowStyle": JsCode("""
+                                    function(params) {
+                                        if (params.node && params.node.rowPinned) {
+                                            return { 'fontWeight': '800', 'color': '#A16207' };
+                                        }
+                                        return null;
+                                    }
+                                """),
+                            }
+
+                            if mode == "经销商列表" and drill_level == 2:
+                                st.caption("💡 提示：点击经销商行可下钻到门店。")
+                                ag_proj = show_aggrid_table(
+                                    view_df,
+                                    height=620,
+                                    on_row_selected="single",
+                                    column_defs=col_defs,
+                                    grid_options_overrides=grid_overrides,
+                                    key="proj_ag_dist_list",
+                                )
+                                sel_rows = ag_proj.get("selected_rows") if ag_proj else None
+                                if sel_rows is not None and len(sel_rows) > 0:
+                                    first = sel_rows.iloc[0] if isinstance(sel_rows, pd.DataFrame) else sel_rows[0]
+                                    chosen = first.get("经销商名称") if isinstance(first, dict) else first["经销商名称"]
+                                    prov_val = ""
+                                    try:
+                                        prov_val = (first.get("省区") if isinstance(first, dict) else first["省区"]) or ""
+                                    except Exception:
+                                        prov_val = ""
+                                    st.session_state.proj_selected_dist = chosen
+                                    st.session_state.proj_selected_prov = str(prov_val).strip() or None
+                                    st.session_state.proj_drill_level = 3
+                                    st.rerun()
+
+                            elif mode == "省区汇总" and drill_level == 1:
+                                st.caption("💡 提示：点击省区行可下钻到经销商。")
+                                ag_proj = show_aggrid_table(
+                                    view_df,
+                                    height=620,
+                                    on_row_selected="single",
+                                    column_defs=col_defs,
+                                    grid_options_overrides=grid_overrides,
+                                    key="proj_ag_prov",
+                                )
+                                sel_rows = ag_proj.get("selected_rows") if ag_proj else None
+                                if sel_rows is not None and len(sel_rows) > 0:
+                                    first = sel_rows.iloc[0] if isinstance(sel_rows, pd.DataFrame) else sel_rows[0]
+                                    chosen = first.get(view_dim) if isinstance(first, dict) else first[view_dim]
+                                    st.session_state.proj_selected_prov = chosen
+                                    st.session_state.proj_selected_dist = None
+                                    st.session_state.proj_drill_level = 2
+                                    st.rerun()
+                            elif mode == "省区汇总" and drill_level == 2:
+                                st.caption("💡 提示：点击经销商行可下钻到门店。")
+                                ag_proj = show_aggrid_table(
+                                    view_df,
+                                    height=620,
+                                    on_row_selected="single",
+                                    column_defs=col_defs,
+                                    grid_options_overrides=grid_overrides,
+                                    key="proj_ag_dist_in_prov",
+                                )
+                                sel_rows = ag_proj.get("selected_rows") if ag_proj else None
+                                if sel_rows is not None and len(sel_rows) > 0:
+                                    first = sel_rows.iloc[0] if isinstance(sel_rows, pd.DataFrame) else sel_rows[0]
+                                    chosen = first.get("经销商名称") if isinstance(first, dict) else first["经销商名称"]
+                                    st.session_state.proj_selected_dist = chosen
+                                    st.session_state.proj_drill_level = 3
+                                    st.rerun()
+                            else:
+                                show_aggrid_table(
+                                    view_df,
+                                    height=720,
+                                    column_defs=col_defs,
+                                    grid_options_overrides=grid_overrides,
+                                    key=f"proj_ag_{mode}_{drill_level}",
+                                )
+
+                            export_df = view_df.copy()
+                            export_df = export_df.loc[:, [c for c in export_df.columns if not str(c).startswith("::")]]
+                            export_df = export_df.replace({np.nan: None})
+                            export_df = pd.concat([export_df, pd.DataFrame([total_row])], ignore_index=True)
+
+                            if "proj_export_cache" not in st.session_state:
+                                st.session_state.proj_export_cache = {}
+                            _excel_cache = st.session_state.proj_export_cache
+
+                            sel_prov = st.session_state.get("proj_selected_prov")
+                            sel_dist = st.session_state.get("proj_selected_dist")
+                            month_label = f"{o_month}月" if str(o_month) != "全部" else "全年"
+
+                            if drill_level == 1:
+                                region_label = "全部省区"
+                            elif drill_level == 2 and mode == "省区汇总":
+                                region_label = str(sel_prov or "省区")
+                            elif drill_level == 2 and mode == "经销商列表":
+                                region_label = "35客户"
+                            else:
+                                region_label = str(sel_dist or "经销商")
+
+                            export_id = f"proj_{mode}_{drill_level}"
+
+                            def _excel_key(kind: str):
+                                return (kind, int(proj_year), str(o_month), str(mode), int(drill_level), str(sel_prov or ""), str(sel_dist or ""))
+
+                            number_headers = {
+                                "段粉-目标值",
+                                "段粉-出库值",
+                                "段粉-今日出库",
+                                "雅系列-目标值",
+                                "雅系列-出库值",
+                                "雅系列-今日出库",
+                                "中老年-目标值(提)",
+                                "中老年-出库值(提)",
+                                "中老年-今日出库(提)",
+                            }
+                            percent_headers = {"段粉-完成率", "雅系列-完成率", "中老年-完成率"}
+
+                            title_lines = [
+                                f"专案追踪 - {proj_year}年{month_label}",
+                                f"视图：{mode}｜层级：{drill_level}",
+                                f"区域：{region_label}",
+                                f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                            ]
+
+                            col_types = {}
+                            for c in export_df.columns:
+                                s = str(c)
+                                if "完成率" in s:
+                                    col_types[s] = "pct"
+                                elif s == "门店类型":
+                                    col_types[s] = "tag"
+                                elif s in number_headers:
+                                    col_types[s] = "num"
+                                else:
+                                    col_types[s] = "text"
+
+                            c_e1, c_e2, c_e3, c_e4 = st.columns([1.4, 1.9, 1.6, 3.1])
+                            k_cur = _excel_key("current")
+                            with c_e1:
+                                if st.button("生成当前视图Excel", key=f"{export_id}_gen_cur"):
+                                    with st.spinner("正在生成Excel…"):
+                                        xlsx_bytes = _df_to_excel_bytes(
+                                            export_df,
+                                            sheet_name="专案追踪",
+                                            title_lines=title_lines,
+                                            number_headers=number_headers,
+                                            percent_headers=percent_headers,
+                                            store_type_header="门店类型",
+                                            group_headers=True,
+                                        )
+                                        _excel_cache[k_cur] = {
+                                            "bytes": xlsx_bytes,
+                                            "name": sanitize_filename(f"专案追踪_{region_label}_{proj_year}_{month_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"),
+                                        }
+                            with c_e2:
+                                if k_cur in _excel_cache:
+                                    st.download_button(
+                                        "下载当前视图Excel",
+                                        data=_excel_cache[k_cur]["bytes"],
+                                        file_name=_excel_cache[k_cur]["name"],
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        key=f"{export_id}_dl_cur",
+                                    )
+
+                            def _detail_store_df(all_scope: bool):
+                                d = store_df.copy()
+                                if not all_scope:
+                                    if mode == "省区汇总" and drill_level >= 2 and sel_prov:
+                                        d = d[d["省区"].astype(str).str.strip() == str(sel_prov).strip()].copy()
+                                    if drill_level == 3 and sel_dist:
+                                        d = d[d["经销商名称"].astype(str).str.replace(r"\s+", "", regex=True) == str(sel_dist).strip().replace(" ", "")].copy()
+                                cols = [
+                                    "省区",
+                                    "经销商名称",
+                                    "门店名称",
+                                    "门店类型",
+                                    "段粉-目标值",
+                                    "段粉-出库值",
+                                    "段粉-完成率",
+                                    "段粉-今日出库",
+                                    "雅系列-目标值",
+                                    "雅系列-出库值",
+                                    "雅系列-完成率",
+                                    "雅系列-今日出库",
+                                    "中老年-目标值(提)",
+                                    "中老年-出库值(提)",
+                                    "中老年-完成率",
+                                    "中老年-今日出库(提)",
+                                ]
+                                d = d[cols].copy()
+                                d = d.loc[:, [c for c in d.columns if not str(c).startswith("::")]]
+                                d = d.replace({np.nan: None})
+                                return d
+
+                            k_detail = _excel_key("detail_store")
+                            with c_e3:
+                                if st.button("生成门店明细Excel", key=f"{export_id}_gen_detail"):
+                                    with st.spinner("正在生成门店明细Excel…"):
+                                        df_detail = _detail_store_df(all_scope=False)
+                                        total_detail = _total_row_from_df(df_detail, "合计")
+                                        df_detail = pd.concat([df_detail, pd.DataFrame([total_detail])], ignore_index=True)
+                                        xlsx_detail = _df_to_excel_bytes(
+                                            df_detail,
+                                            sheet_name="专案追踪",
+                                            title_lines=[
+                                                f"专案追踪 - {proj_year}年{month_label}（门店明细）",
+                                                f"区域：{region_label}",
+                                                f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                                            ],
+                                            number_headers=number_headers,
+                                            percent_headers=percent_headers,
+                                            store_type_header="门店类型",
+                                            group_headers=True,
+                                        )
+                                        _excel_cache[k_detail] = {
+                                            "bytes": xlsx_detail,
+                                            "name": sanitize_filename(f"专案追踪_门店明细_{region_label}_{proj_year}_{month_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"),
+                                        }
+                            with c_e4:
+                                if k_detail in _excel_cache:
+                                    st.download_button(
+                                        "下载门店明细Excel",
+                                        data=_excel_cache[k_detail]["bytes"],
+                                        file_name=_excel_cache[k_detail]["name"],
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        key=f"{export_id}_dl_detail",
+                                    )
+
+                            k_all = _excel_key("all_store")
+                            c_all_1, c_all_2, _ = st.columns([1.6, 2.0, 6.4])
+                            with c_all_1:
+                                if st.button("生成导出全部Excel（门店明细）", key=f"{export_id}_gen_all"):
+                                    with st.spinner("正在生成导出全部Excel…"):
+                                        df_all = _detail_store_df(all_scope=True)
+                                        df_all = df_all.loc[:, [c for c in df_all.columns if not str(c).startswith("::")]]
+                                        total_all = _total_row_from_df(df_all, "合计")
+                                        df_all = pd.concat([df_all, pd.DataFrame([total_all])], ignore_index=True)
+                                        xlsx_all = _df_to_excel_bytes(
+                                            df_all,
+                                            sheet_name="专案追踪",
+                                            title_lines=[
+                                                f"专案追踪 - {proj_year}年{month_label}（导出全部门店明细）",
+                                                "范围：所有省区｜所有经销商｜所有门店",
+                                                f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                                            ],
+                                            number_headers=number_headers,
+                                            percent_headers=percent_headers,
+                                            store_type_header="门店类型",
+                                            group_headers=True,
+                                        )
+                                        _excel_cache[k_all] = {
+                                            "bytes": xlsx_all,
+                                            "name": sanitize_filename(f"专案追踪_导出全部_门店明细_{proj_year}_{month_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"),
+                                        }
+                            with c_all_2:
+                                if k_all in _excel_cache:
+                                    st.download_button(
+                                        "下载导出全部Excel（门店明细）",
+                                        data=_excel_cache[k_all]["bytes"],
+                                        file_name=_excel_cache[k_all]["name"],
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        key=f"{export_id}_dl_all",
+                                    )
+
+                            if st.button("生成表格图片（含颜色）", key=f"{export_id}_gen_png"):
+                                st.session_state[f"{export_id}_png"] = _pil_table_png(export_df, title_lines, font_size=16, col_types=col_types)
+                                st.session_state[f"{export_id}_png_name"] = sanitize_filename(f"专案追踪_{region_label}_{proj_year}_{month_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+                            if st.session_state.get(f"{export_id}_png"):
+                                st.download_button(
+                                    "下载PNG",
+                                    data=st.session_state[f"{export_id}_png"],
+                                    file_name=st.session_state.get(f"{export_id}_png_name", "专案追踪.png"),
+                                    mime="image/png",
+                                    key=f"{export_id}_dl_png",
+                                )
+
+                            if mode == "经销商列表" and drill_level == 2:
+                                zip_id = f"{export_id}_zip_{proj_year}_{month_label}"
+                                if st.button("批量生成门店明细PNG（ZIP）", key=f"{zip_id}_btn"):
+                                    dists = sorted([x for x in store_df["经销商名称"].dropna().astype(str).unique().tolist() if x and x.lower() not in ("nan", "none", "null")])
+                                    zip_buf = io.BytesIO()
+                                    with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                                        prog = st.progress(0)
+                                        total = max(1, len(dists))
+                                        for i, dist_name in enumerate(dists):
+                                            df_d = store_df[store_df["经销商名称"].astype(str).str.replace(r"\s+", "", regex=True) == str(dist_name).strip().replace(" ", "")].copy()
+                                            if df_d.empty:
+                                                prog.progress(int((i + 1) * 100 / total))
+                                                continue
+                                            df_d = df_d.loc[:, [c for c in df_d.columns if not str(c).startswith("::")]]
+                                            df_d = df_d.replace({np.nan: None})
+                                            total_d = _total_row_from_df(df_d, "合计")
+                                            df_d = pd.concat([df_d, pd.DataFrame([total_d])], ignore_index=True)
+                                            col_types_d = {c: ("pct" if "完成率" in c else ("tag" if c == "门店类型" else ("num" if c in number_headers else "text"))) for c in df_d.columns}
+                                            png = _pil_table_png(
+                                                df_d,
+                                                [
+                                                    f"专案追踪 - {proj_year}年{month_label}（门店明细）",
+                                                    f"经销商：{dist_name}",
+                                                    f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                                                ],
+                                                font_size=16,
+                                                col_types=col_types_d,
+                                            )
+                                            zf.writestr(sanitize_filename(dist_name, default="export") + ".png", png)
+                                            prog.progress(int((i + 1) * 100 / total))
+                                    st.session_state[f"{zip_id}_bytes"] = zip_buf.getvalue()
+                                    st.session_state[f"{zip_id}_name"] = sanitize_filename(f"专案追踪_门店明细PNG_{proj_year}_{month_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
+                                if st.session_state.get(f"{zip_id}_bytes"):
+                                    st.download_button(
+                                        "下载ZIP",
+                                        data=st.session_state[f"{zip_id}_bytes"],
+                                        file_name=st.session_state.get(f"{zip_id}_name", "专案追踪.zip"),
+                                        mime="application/zip",
+                                        key=f"{zip_id}_dl",
+                                    )
 
                     st.markdown("</div>", unsafe_allow_html=True)
 
