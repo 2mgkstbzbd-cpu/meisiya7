@@ -55,8 +55,10 @@ def _df_to_excel_bytes(
     sheet_name: str,
     title_lines: list[str] | None = None,
     number_headers: set[str] | None = None,
+    number_formats: dict[str, str] | None = None,
     trend_type_header: str | None = None,
     percent_headers: set[str] | None = None,
+    percent_formats: dict[str, str] | None = None,
     store_type_header: str | None = None,
     group_headers: bool = False,
 ):
@@ -200,6 +202,8 @@ def _df_to_excel_bytes(
     pct_fmt = "0.#%"
     number_headers = number_headers or set()
     percent_headers = percent_headers or set()
+    number_formats = number_formats or {}
+    percent_formats = percent_formats or {}
 
     even_fill = PatternFill("solid", fgColor="F8FAFC")
     total_fill = None
@@ -219,9 +223,15 @@ def _df_to_excel_bytes(
                     cell.fill = even_fill
                 if is_total_row:
                     cell.font = Font(bold=True, color="A16207")
-            if headers[col - 1] in number_headers:
+            fmt_override = number_formats.get(headers[col - 1])
+            if fmt_override:
+                cell.number_format = fmt_override
+            elif headers[col - 1] in number_headers:
                 cell.number_format = num_fmt
-            if headers[col - 1] in percent_headers:
+            pct_override = percent_formats.get(headers[col - 1])
+            if pct_override:
+                cell.number_format = pct_override
+            elif headers[col - 1] in percent_headers:
                 cell.number_format = pct_fmt
             if trend_col_idx and col == trend_col_idx:
                 v = str(cell.value or "").strip()
@@ -1077,6 +1087,16 @@ function(params) {
 }
 """)
 
+JS_FMT_NUM_1DP = JsCode("""
+function(params) {
+    const v = params.value;
+    if (v === null || v === undefined) return '';
+    const n = Number(v);
+    if (!isFinite(n)) return '';
+    return n.toLocaleString('zh-CN', {minimumFractionDigits: 1, maximumFractionDigits: 1});
+}
+""")
+
 JS_FMT_PCT_RATIO = JsCode("""
 function(params) {
     const v = params.value;
@@ -1088,6 +1108,17 @@ function(params) {
     const minF = isInt ? 0 : 1;
     const maxF = isInt ? 0 : 1;
     return p.toLocaleString('zh-CN', {minimumFractionDigits: minF, maximumFractionDigits: maxF}) + '%';
+}
+""")
+
+JS_FMT_PCT_RATIO_1DP = JsCode("""
+function(params) {
+    const v = params.value;
+    if (v === null || v === undefined) return '';
+    const n = Number(v);
+    if (!isFinite(n)) return '';
+    const p = n * 100;
+    return p.toLocaleString('zh-CN', {minimumFractionDigits: 1, maximumFractionDigits: 1}) + '%';
 }
 """)
 
@@ -2218,6 +2249,7 @@ def load_data_v3(file_bytes: bytes, file_name: str):
         df_perf_raw = None
         df_target_raw = None
         df_scan_raw = None
+        df_newcust_raw = None
 
         if file_name_lower.endswith('.csv'):
             df = pd.read_csv(bio, encoding='gb18030')
@@ -2256,6 +2288,13 @@ def load_data_v3(file_bytes: bytes, file_name: str):
 
             # Sheet 6: Scan Data
             if len(xl.sheet_names) > 5: df_scan_raw = xl.parse(5)
+
+            # Sheet 8: New Customers
+            if len(xl.sheet_names) > 7:
+                try:
+                    df_newcust_raw = xl.parse(7)
+                except Exception:
+                    df_newcust_raw = None
 
         # --- Process Sheet 1 (Sales) ---
         if df is not None:
@@ -2319,39 +2358,80 @@ def load_data_v3(file_bytes: bytes, file_name: str):
         # --- Process Sheet 2 (Stock) ---
         if df_stock is not None:
             df_stock.columns = [str(c).strip() for c in df_stock.columns]
-            stock_cols_map = {
-                0: '经销商编码', 1: '经销商全称', 2: '产品编码', 3: '产品名称', 
-                4: '库存数量(听/盒)', 5: '箱数', 6: '省区名称', 7: '经销商名称', # 7=客户简称
-                8: '产品大类', 9: '产品小类', 10: '重量', 11: '规格'
-            }
-            if len(df_stock.columns) >= 12:
-                new_cols = list(df_stock.columns)
-                for idx, name in stock_cols_map.items():
-                    if idx < len(new_cols): new_cols[idx] = name
-                df_stock.columns = new_cols
-                df_stock['箱数'] = pd.to_numeric(df_stock['箱数'], errors='coerce').fillna(0)
-                
-                # CLEAN DISTRIBUTOR NAME STRICTLY
-                if '经销商名称' in df_stock.columns:
-                    df_stock['经销商名称'] = df_stock['经销商名称'].astype(str).str.replace(r'\s+', '', regex=True)
-                
-                df_stock['重量'] = df_stock['重量'].astype(str)
-                df_stock['规格'] = df_stock['规格'].astype(str)
-                
-                name_series = df_stock['产品名称'].astype(str)
-                mask_ya = name_series.str.contains('雅赋|雅耀|雅舒|雅护', regex=True)
-                mask_seg_cat = df_stock['产品大类'].astype(str) == '美思雅段粉'
-                seg_extract = name_series.str.extract(r'(1段|2段|3段)')[0]
-                ya_extract = name_series.str.extract(r'(雅赋|雅耀|雅舒|雅护)')[0]
-                
-                df_stock['具体分类'] = np.where(mask_ya, ya_extract, np.where(mask_seg_cat & seg_extract.notna(), seg_extract, '其他'))
-                df_stock['具体分类'] = df_stock['具体分类'].fillna('其他').astype(str)
-                 
-                if '重量' in df_stock.columns:
-                    valid_weights = ['700', '800', '800-新包装']
-                    df_stock = df_stock[df_stock['重量'].isin(valid_weights)]
-            else:
-                df_stock = None
+            df_cols = list(df_stock.columns)
+            def _col_by_name(names: list[str]):
+                for n in names:
+                    if n in df_stock.columns:
+                        return n
+                for c in df_stock.columns:
+                    s = str(c).strip()
+                    if any(n in s for n in names):
+                        return c
+                return None
+
+            col_dist_abbr = _col_by_name(["客户简称"])
+            col_dist_full = _col_by_name(["经销商名称", "经销商全称"])
+            col_dist_code = _col_by_name(["经销商编码"])
+            col_prod_code = _col_by_name(["产品编码"])
+            col_prod_name = _col_by_name(["产品名称"])
+            col_qty = _col_by_name(["库存数量", "库存数量(听/盒)"])
+            col_box = _col_by_name(["箱数", "箱"])
+            col_prov = _col_by_name(["省区名称", "省区"])
+            col_big = _col_by_name(["产品大类", "大类"])
+            col_small = _col_by_name(["产品小类", "小类"])
+            col_weight = _col_by_name(["重量"])
+            col_spec = _col_by_name(["规格"])
+
+            if col_prod_name is None and len(df_cols) >= 4:
+                col_prod_name = df_cols[3]
+            if col_box is None and len(df_cols) >= 6:
+                col_box = df_cols[5]
+            if col_prov is None and len(df_cols) >= 7:
+                col_prov = df_cols[6]
+            if col_dist_abbr is None and len(df_cols) >= 8:
+                col_dist_abbr = df_cols[7]
+            if col_big is None and len(df_cols) >= 10:
+                col_big = df_cols[9]
+            if col_small is None and len(df_cols) >= 11:
+                col_small = df_cols[10]
+            if col_weight is None and len(df_cols) >= 12:
+                col_weight = df_cols[11] if col_spec is not None else None
+
+            df_stock = pd.DataFrame({
+                "经销商编码": df_stock[col_dist_code] if col_dist_code is not None else (df_stock[df_cols[0]] if len(df_cols) > 0 else pd.Series([], dtype=object)),
+                "经销商全称": df_stock[col_dist_full] if col_dist_full is not None else (df_stock[df_cols[1]] if len(df_cols) > 1 else pd.Series([], dtype=object)),
+                "产品编码": df_stock[col_prod_code] if col_prod_code is not None else (df_stock[df_cols[2]] if len(df_cols) > 2 else pd.Series([], dtype=object)),
+                "产品名称": df_stock[col_prod_name] if col_prod_name is not None else pd.Series([], dtype=object),
+                "库存数量(听/盒)": df_stock[col_qty] if col_qty is not None else (df_stock[df_cols[4]] if len(df_cols) > 4 else pd.Series([], dtype=object)),
+                "箱数": df_stock[col_box] if col_box is not None else pd.Series([], dtype=object),
+                "省区": df_stock[col_prov] if col_prov is not None else pd.Series([], dtype=object),
+                "经销商名称": df_stock[col_dist_abbr] if col_dist_abbr is not None else (df_stock[col_dist_full] if col_dist_full is not None else pd.Series([], dtype=object)),
+                "产品大类": df_stock[col_big] if col_big is not None else pd.Series([], dtype=object),
+                "产品小类": df_stock[col_small] if col_small is not None else pd.Series([], dtype=object),
+                "重量": df_stock[col_weight] if col_weight is not None else pd.Series([], dtype=object),
+                "规格": df_stock[col_spec] if col_spec is not None else pd.Series([], dtype=object),
+            })
+
+            df_stock["箱数"] = pd.to_numeric(df_stock["箱数"], errors="coerce").fillna(0.0)
+            df_stock["库存数量(听/盒)"] = pd.to_numeric(df_stock["库存数量(听/盒)"], errors="coerce").fillna(0.0)
+            for _c in ["省区", "产品大类", "产品小类", "重量", "规格"]:
+                df_stock[_c] = df_stock[_c].fillna("").astype(str).str.strip()
+            df_stock["经销商名称"] = df_stock["经销商名称"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+            df_stock["经销商全称"] = df_stock["经销商全称"].fillna("").astype(str).str.strip()
+            df_stock["产品名称"] = df_stock["产品名称"].fillna("").astype(str).str.strip()
+
+            name_series = df_stock["产品名称"].astype(str)
+            mask_ya = name_series.str.contains("雅赋|雅耀|雅舒|雅护", regex=True)
+            mask_seg_cat = df_stock["产品大类"].astype(str) == "美思雅段粉"
+            seg_extract = name_series.str.extract(r"(1段|2段|3段)")[0]
+            ya_extract = name_series.str.extract(r"(雅赋|雅耀|雅舒|雅护)")[0]
+            df_stock["具体分类"] = np.where(mask_ya, ya_extract, np.where(mask_seg_cat & seg_extract.notna(), seg_extract, "其他"))
+            df_stock["具体分类"] = df_stock["具体分类"].fillna("其他").astype(str)
+
+            if "重量" in df_stock.columns:
+                valid_weights = ["700", "800", "800-新包装"]
+                if df_stock["重量"].isin(valid_weights).any():
+                    df_stock = df_stock[df_stock["重量"].isin(valid_weights)]
 
         # --- Process Sheet 3 (Outbound) FIX ---
         if df_q4_raw is not None:
@@ -2560,16 +2640,33 @@ def load_data_v3(file_bytes: bytes, file_name: str):
                     return df0.iloc[:, idx]
                 return pd.Series([None] * len(df0))
 
+            store_src = df0[store_col] if store_col is not None else _col(1)
+            dist_src = df0[dist_col] if dist_col is not None else _col(18)
+            prov_src = df0[prov_col] if prov_col is not None else _col(17)
+            cat_src = df0[cat_col] if cat_col is not None else _col(19)
+            small_src = df0[small_col] if small_col is not None else _col(20)
+            y_src = df0[y_col] if y_col is not None else _col(13)
+            m_src = df0[m_col] if m_col is not None else _col(14)
+            d_src = df0[d_col] if d_col is not None else _col(15)
+
+            if df0.shape[1] > 18:
+                _s_store = _col(1).fillna("").astype(str)
+                _s_dist = _col(18).fillna("").astype(str)
+                if (_s_store.str.strip() != "").mean() >= 0.05:
+                    store_src = _col(1)
+                if (_s_dist.str.strip() != "").mean() >= 0.05:
+                    dist_src = _col(18)
+
             df_scan_raw = pd.DataFrame({
-                "门店名称": df0[store_col] if store_col is not None else _col(1),
-                "经销商名称": df0[dist_col] if dist_col is not None else _col(18),
-                "省区": df0[prov_col] if prov_col is not None else _col(17),
-                "产品大类": df0[cat_col] if cat_col is not None else _col(19),
-                "产品小类": df0[small_col] if small_col is not None else _col(20),
+                "门店名称": store_src,
+                "经销商名称": dist_src,
+                "省区": prov_src,
+                "产品大类": cat_src,
+                "产品小类": small_src,
                 "经纬度": df0[coord_col] if coord_col is not None else _col(12),
-                "年份": df0[y_col] if y_col is not None else _col(13),
-                "月份": df0[m_col] if m_col is not None else _col(14),
-                "日": df0[d_col] if d_col is not None else _col(15),
+                "年份": y_src,
+                "月份": m_src,
+                "日": d_src,
             })
 
             df_scan_raw["年份"] = df_scan_raw["年份"].astype(str).str.extract(r"(\d+)")[0].astype(float).fillna(0).astype(int)
@@ -2579,16 +2676,51 @@ def load_data_v3(file_bytes: bytes, file_name: str):
 
             for c in ["门店名称", "省区", "经销商名称", "产品大类", "产品小类"]:
                 df_scan_raw[c] = df_scan_raw[c].fillna("").astype(str).str.strip()
+            df_scan_raw["门店名称"] = df_scan_raw["门店名称"].astype(str).str.replace(r"\s+", "", regex=True)
+            df_scan_raw["经销商名称"] = df_scan_raw["经销商名称"].astype(str).str.replace(r"\s+", "", regex=True)
 
             coords = df_scan_raw["经纬度"].apply(_parse_lon_lat)
             df_scan_raw["经度"] = coords.apply(lambda x: x[0])
             df_scan_raw["纬度"] = coords.apply(lambda x: x[1])
 
-        return df, month_cols, df_stock, df_q4_raw, df_perf_raw, df_target_raw, df_scan_raw, debug_logs
+        if df_newcust_raw is not None and not getattr(df_newcust_raw, "empty", True):
+            try:
+                df0 = df_newcust_raw.copy()
+                df0.columns = [str(c).strip() for c in df0.columns]
+                def _col(idx: int):
+                    if idx < df0.shape[1]:
+                        return df0.iloc[:, idx]
+                    return pd.Series([None] * len(df0))
+                prov_s = _col(0)
+                store_s = _col(4)
+                time_s = _col(5)
+                val_s = _col(6)
+                dist_s = _col(9)
+                df_newcust_raw = pd.DataFrame({
+                    "省区": prov_s,
+                    "门店名称": store_s,
+                    "经销商名称": dist_s,
+                    "时间": time_s,
+                    "新客数": val_s,
+                })
+                for c in ["省区", "门店名称", "经销商名称", "时间"]:
+                    df_newcust_raw[c] = df_newcust_raw[c].fillna("").astype(str).str.strip()
+                df_newcust_raw["经销商名称"] = df_newcust_raw["经销商名称"].astype(str).str.replace(r"\s+", "", regex=True)
+                df_newcust_raw["新客数"] = pd.to_numeric(df_newcust_raw["新客数"], errors="coerce").fillna(0.0)
+                t = df_newcust_raw["时间"].astype(str)
+                ym = t.str.extract(r"(\d{4})\D{0,3}(\d{1,2})")
+                yy = pd.to_numeric(ym[0], errors="coerce").fillna(0).astype(int)
+                mm = pd.to_numeric(ym[1], errors="coerce").fillna(0).astype(int)
+                df_newcust_raw["_ym"] = (yy * 100 + mm).astype(int)
+                df_newcust_raw = df_newcust_raw[df_newcust_raw["_ym"].between(200001, 209912)].copy()
+            except Exception:
+                df_newcust_raw = None
+
+        return df, month_cols, df_stock, df_q4_raw, df_perf_raw, df_target_raw, df_scan_raw, df_newcust_raw, debug_logs
         
     except Exception as e:
         import traceback
-        return None, None, None, None, None, None, None, [f"Error: {str(e)}", traceback.format_exc()]
+        return None, None, None, None, None, None, None, None, [f"Error: {str(e)}", traceback.format_exc()]
 
 @st.cache_data(ttl=3600)
 def load_builtin_perf_2025():
@@ -3042,6 +3174,164 @@ def _build_project_tracking_store_df(
     store_df["中老年-完成率"] = store_df.apply(lambda r: _rate(r["中老年-出库值(提)"], r["中老年-目标值(提)"]), axis=1)
     store_df["中老年-今日出库(提)"] = store_df["中老年_今日出库"].astype(float)
 
+    store_df["库存"] = 0.0
+    store_df["本月新客"] = 0.0
+    store_df["近三月新客"] = 0.0
+    store_df["累计新客"] = 0.0
+    store_df["本月扫码"] = 0.0
+    store_df["本月扫码率"] = 0.0
+
+    anchor_ym = None
+    if month is not None:
+        anchor_ym = int(int(year) * 100 + int(month))
+    else:
+        try:
+            if "_月" in df_out_all.columns:
+                mm = pd.to_numeric(df_out_all["_月"], errors="coerce").fillna(0).astype(int)
+                mm = mm[(mm >= 1) & (mm <= 12)]
+                if not mm.empty:
+                    anchor_ym = int(int(year) * 100 + int(mm.max()))
+        except Exception:
+            anchor_ym = None
+
+    if anchor_ym is None:
+        try:
+            _scan = globals().get("df_scan_raw")
+            if _scan is not None and not getattr(_scan, "empty", True):
+                _s0 = _scan.copy()
+                _s0["_ym"] = (pd.to_numeric(_s0.get("年份", 0), errors="coerce").fillna(0).astype(int) * 100 + pd.to_numeric(_s0.get("月份", 0), errors="coerce").fillna(0).astype(int)).astype(int)
+                _s0 = _s0[_s0["_ym"].between(200001, 209912)]
+                _s0 = _s0[_s0["_ym"].astype(int).astype(str).str.startswith(str(int(year)))]
+                if not _s0.empty:
+                    anchor_ym = int(pd.to_numeric(_s0["_ym"], errors="coerce").fillna(0).max())
+        except Exception:
+            anchor_ym = None
+
+    if anchor_ym is not None:
+        y = int(anchor_ym // 100)
+        m = int(anchor_ym % 100)
+        prev3 = []
+        y2, m2 = y, m
+        for _ in range(3):
+            m2 -= 1
+            if m2 <= 0:
+                y2 -= 1
+                m2 += 12
+            prev3.append(int(y2 * 100 + m2))
+
+        nc0 = globals().get("df_newcust_raw")
+        if nc0 is not None and not getattr(nc0, "empty", True) and "_ym" in nc0.columns:
+            nc = nc0.copy()
+            if "省区" in nc.columns:
+                nc["省区"] = nc["省区"].fillna("").astype(str).str.strip()
+            if "经销商名称" in nc.columns:
+                nc["经销商名称"] = nc["经销商名称"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+            if "门店名称" in nc.columns:
+                nc["门店名称"] = nc["门店名称"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+            if "新客数" in nc.columns:
+                nc["新客数"] = pd.to_numeric(nc["新客数"], errors="coerce").fillna(0.0)
+            nc["_ym"] = pd.to_numeric(nc["_ym"], errors="coerce").fillna(0).astype(int)
+            nc = nc[nc["_ym"].between(200001, 209912)].copy()
+            nc = nc[nc["_ym"] <= anchor_ym].copy()
+            cur = nc[nc["_ym"] == anchor_ym].groupby(["省区", "经销商名称", "门店名称"], as_index=False)["新客数"].sum().rename(columns={"新客数": "本月新客"})
+            p3 = nc[nc["_ym"].isin(prev3)].groupby(["省区", "经销商名称", "门店名称"], as_index=False)["新客数"].sum().rename(columns={"新客数": "近三月新客"})
+            cum = nc[(nc["_ym"] >= 202501) & (nc["_ym"] <= anchor_ym)].groupby(["省区", "经销商名称", "门店名称"], as_index=False)["新客数"].sum().rename(columns={"新客数": "累计新客"})
+            for _df in (cur, p3, cum):
+                _df["省区"] = _df["省区"].fillna("").astype(str).str.strip()
+                _df["经销商名称"] = _df["经销商名称"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                _df["门店名称"] = _df["门店名称"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+            store_df = store_df.merge(cur, on=["省区", "经销商名称", "门店名称"], how="left")
+            store_df = store_df.merge(p3, on=["省区", "经销商名称", "门店名称"], how="left")
+            store_df = store_df.merge(cum, on=["省区", "经销商名称", "门店名称"], how="left")
+            for _c in ["本月新客", "近三月新客", "累计新客"]:
+                if _c in store_df.columns:
+                    store_df[_c] = pd.to_numeric(store_df[_c], errors="coerce").fillna(0.0)
+                else:
+                    store_df[_c] = 0.0
+
+        st0 = globals().get("df_stock_raw")
+        if st0 is not None and not getattr(st0, "empty", True):
+            _s = st0.copy()
+            if "省区" not in _s.columns and "省区名称" in _s.columns:
+                _s["省区"] = _s["省区名称"]
+            for _c in ["省区", "经销商名称", "产品大类", "产品名称", "重量"]:
+                if _c in _s.columns:
+                    if _c == "经销商名称":
+                        _s[_c] = _s[_c].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                    else:
+                        _s[_c] = _s[_c].fillna("").astype(str).str.strip()
+            if "箱数" in _s.columns:
+                _s["箱数"] = pd.to_numeric(_s["箱数"], errors="coerce").fillna(0.0)
+            else:
+                _s["箱数"] = 0.0
+            _mask_seg = pd.Series(False, index=_s.index)
+            if "产品大类" in _s.columns:
+                _mask_seg |= _s["产品大类"].astype(str).str.strip().eq("美思雅段粉")
+                _mask_seg |= _s["产品大类"].astype(str).str.contains("中老年", regex=False)
+            if "产品名称" in _s.columns:
+                _mask_seg |= _s["产品名称"].astype(str).str.contains(r"(雅赋|雅耀|雅舒|雅护)", regex=True)
+            if _mask_seg.any():
+                _s = _s[_mask_seg].copy()
+            if "产品大类" in _s.columns and "重量" in _s.columns:
+                w_digits = _s["重量"].astype(str).str.extract(r"(\d{3})")[0].fillna("")
+                _s = _s[~((_s["产品大类"].astype(str).str.strip() == "美思雅段粉") & (w_digits.astype(str) != "800"))].copy()
+            inv = _s.groupby(["省区", "经销商名称"], as_index=False)["箱数"].sum().rename(columns={"箱数": "库存"})
+            for _c in ["省区", "经销商名称"]:
+                inv[_c] = inv[_c].fillna("").astype(str).str.replace(r"\s+", "", regex=True) if _c == "经销商名称" else inv[_c].fillna("").astype(str).str.strip()
+            store_df = store_df.merge(inv, on=["省区", "经销商名称"], how="left", suffixes=("", "_y"))
+            if "库存_y" in store_df.columns:
+                store_df.drop(columns=["库存"], inplace=True, errors="ignore")
+                store_df.rename(columns={"库存_y": "库存"}, inplace=True)
+            store_df["库存"] = pd.to_numeric(store_df.get("库存", 0), errors="coerce").fillna(0.0)
+
+        sc0 = globals().get("df_scan_raw")
+        if sc0 is not None and not getattr(sc0, "empty", True):
+            s = sc0.copy()
+            for _c in ["省区", "经销商名称", "门店名称", "产品大类", "产品小类"]:
+                if _c in s.columns:
+                    if _c in ("经销商名称", "门店名称"):
+                        s[_c] = s[_c].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                    else:
+                        s[_c] = s[_c].fillna("").astype(str).str.strip()
+            s["年份"] = pd.to_numeric(s.get("年份", 0), errors="coerce").fillna(0).astype(int)
+            s["月份"] = pd.to_numeric(s.get("月份", 0), errors="coerce").fillna(0).astype(int)
+            s = s[(s["年份"] > 0) & (s["月份"].between(1, 12))].copy()
+            s["_ym"] = (s["年份"] * 100 + s["月份"]).astype(int)
+            s = s[s["_ym"] == anchor_ym].copy()
+            if not s.empty:
+                _mask = pd.Series(False, index=s.index)
+                if "产品大类" in s.columns:
+                    _mask |= s["产品大类"].astype(str).str.strip().eq("美思雅段粉")
+                    _mask |= s["产品大类"].astype(str).str.contains("中老年", regex=False)
+                if "产品小类" in s.columns:
+                    _mask |= s["产品小类"].astype(str).str.contains(r"(雅赋|雅耀|雅舒|雅护)", regex=True)
+                s = s[_mask].copy()
+                if not s.empty and "产品大类" in s.columns and "产品小类" in s.columns:
+                    w_digits = s["产品小类"].astype(str).str.extract(r"(\d{3})")[0].fillna("")
+                    s = s[~((s["产品大类"].astype(str).str.strip() == "美思雅段粉") & (w_digits.astype(str) != "800"))].copy()
+                if not s.empty:
+                    scan_agg = (
+                        s.groupby(["省区", "经销商名称", "门店名称"], as_index=False)
+                        .size()
+                        .rename(columns={"size": "_扫码听数"})
+                    )
+                    scan_agg["本月扫码"] = pd.to_numeric(scan_agg["_扫码听数"], errors="coerce").fillna(0.0) / 6.0
+                    scan_agg.drop(columns=["_扫码听数"], inplace=True, errors="ignore")
+                    store_df = store_df.merge(scan_agg, on=["省区", "经销商名称", "门店名称"], how="left", suffixes=("", "_y"))
+                    if "本月扫码_y" in store_df.columns:
+                        store_df.drop(columns=["本月扫码"], inplace=True, errors="ignore")
+                        store_df.rename(columns={"本月扫码_y": "本月扫码"}, inplace=True)
+                    store_df["本月扫码"] = pd.to_numeric(store_df.get("本月扫码", 0), errors="coerce").fillna(0.0)
+
+        out_box = (
+            pd.to_numeric(store_df.get("段粉-出库值", 0), errors="coerce").fillna(0.0)
+            + pd.to_numeric(store_df.get("雅系列-出库值", 0), errors="coerce").fillna(0.0)
+            + (pd.to_numeric(store_df.get("中老年-出库值(提)", 0), errors="coerce").fillna(0.0) / 3.0)
+        )
+        scan_box = pd.to_numeric(store_df.get("本月扫码", 0), errors="coerce").fillna(0.0)
+        store_df["本月扫码率"] = np.where(out_box > 0, scan_box / out_box, 0.0)
+        store_df["本月扫码率"] = pd.to_numeric(store_df.get("本月扫码率", 0), errors="coerce").fillna(0.0)
+
     keep = [
         "省区",
         "经销商名称",
@@ -3059,6 +3349,12 @@ def _build_project_tracking_store_df(
         "中老年-出库值(提)",
         "中老年-完成率",
         "中老年-今日出库(提)",
+        "库存",
+        "本月新客",
+        "近三月新客",
+        "累计新客",
+        "本月扫码",
+        "本月扫码率",
     ]
     store_df = store_df[keep].copy()
     return store_df, logs
@@ -3128,18 +3424,20 @@ if uploaded_file:
 
     parsed_cache = st.session_state.get("_parsed_cache", {})
     if cached_sig in parsed_cache:
-        # Check if cache is old version (7 elements) or new version (8 elements)
+        # Check cache format
         cache_val = parsed_cache[cached_sig]
-        if len(cache_val) == 8:
+        if len(cache_val) == 9:
+            df_raw, month_cols, df_stock_raw, df_q4_raw, df_perf_raw, df_target_raw, df_scan_raw, df_newcust_raw, debug_logs = cache_val
+        elif len(cache_val) == 8:
             df_raw, month_cols, df_stock_raw, df_q4_raw, df_perf_raw, df_target_raw, df_scan_raw, debug_logs = cache_val
+            df_newcust_raw = None
         else:
-            # Re-parse if cache format mismatch (Old cache had 7 items)
-            df_raw, month_cols, df_stock_raw, df_q4_raw, df_perf_raw, df_target_raw, df_scan_raw, debug_logs = load_data_v3(cached_bytes, uploaded_name)
-            parsed_cache[cached_sig] = (df_raw, month_cols, df_stock_raw, df_q4_raw, df_perf_raw, df_target_raw, df_scan_raw, debug_logs)
+            df_raw, month_cols, df_stock_raw, df_q4_raw, df_perf_raw, df_target_raw, df_scan_raw, df_newcust_raw, debug_logs = load_data_v3(cached_bytes, uploaded_name)
+            parsed_cache[cached_sig] = (df_raw, month_cols, df_stock_raw, df_q4_raw, df_perf_raw, df_target_raw, df_scan_raw, df_newcust_raw, debug_logs)
             st.session_state["_parsed_cache"] = parsed_cache
     else:
-        df_raw, month_cols, df_stock_raw, df_q4_raw, df_perf_raw, df_target_raw, df_scan_raw, debug_logs = load_data_v3(cached_bytes, uploaded_name)
-        parsed_cache[cached_sig] = (df_raw, month_cols, df_stock_raw, df_q4_raw, df_perf_raw, df_target_raw, df_scan_raw, debug_logs)
+        df_raw, month_cols, df_stock_raw, df_q4_raw, df_perf_raw, df_target_raw, df_scan_raw, df_newcust_raw, debug_logs = load_data_v3(cached_bytes, uploaded_name)
+        parsed_cache[cached_sig] = (df_raw, month_cols, df_stock_raw, df_q4_raw, df_perf_raw, df_target_raw, df_scan_raw, df_newcust_raw, debug_logs)
         if len(parsed_cache) > 2:
             for k in list(parsed_cache.keys())[:-2]:
                 parsed_cache.pop(k, None)
@@ -6245,8 +6543,9 @@ if uploaded_file:
 
                                 pv = pv[sel_yms]
                                 pv.columns = sel_month_cols
-                                pv["合计"] = pv.sum(axis=1)
-                                pv = pv.sort_values("合计", ascending=False).reset_index()
+                                pv["_合计"] = pv.sum(axis=1)
+                                pv = pv.sort_values("_合计", ascending=False).reset_index()
+                                pv.drop(columns=["_合计"], inplace=True, errors="ignore")
 
                                 avg_col = "前三月月均"
                                 if len(first3_cols) >= 1:
@@ -6258,6 +6557,11 @@ if uploaded_file:
                                 feb_col = ym_to_label.get(202602)
                                 if feb_col and (feb_col in pv.columns) and (avg_col in pv.columns):
                                     pv[diff_col] = pd.to_numeric(pv[feb_col], errors="coerce").fillna(0.0) - pd.to_numeric(pv[avg_col], errors="coerce").fillna(0.0)
+                                    _avg_v = pd.to_numeric(pv[avg_col], errors="coerce").fillna(0.0)
+                                    _feb_v = pd.to_numeric(pv[feb_col], errors="coerce").fillna(0.0)
+                                    pv["完成率"] = np.where(_avg_v > 0, _feb_v / _avg_v, 0.0)
+                                else:
+                                    pv["完成率"] = 0.0
 
                                 trend_base_cols = first3_cols if len(first3_cols) >= 1 else sel_month_cols
                                 spark_vals = pv[trend_base_cols].values.tolist() if trend_base_cols else [[] for _ in range(len(pv))]
@@ -6293,6 +6597,196 @@ if uploaded_file:
                                         mnums.append(str(int(mm.group(1))))
                                 avg_header = f"前三月月均（{'、'.join(mnums)}）" if len(mnums) == 3 else "前三月月均"
 
+                                if drill_level in (1, 2) and df_stock_raw is not None and not getattr(df_stock_raw, "empty", True):
+                                    _s = df_stock_raw.copy()
+                                    if "省区" not in _s.columns and "省区名称" in _s.columns:
+                                        _s["省区"] = _s["省区名称"]
+                                    for _c in ["省区", "经销商名称", "产品大类", "产品小类", "重量"]:
+                                        if _c in _s.columns:
+                                            if _c == "经销商名称":
+                                                _s[_c] = _s[_c].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                            else:
+                                                _s[_c] = _s[_c].fillna("").astype(str).str.strip()
+                                    if "箱数" in _s.columns:
+                                        _s["箱数"] = pd.to_numeric(_s["箱数"], errors="coerce").fillna(0.0)
+                                    if drill_level == 2:
+                                        _p = str(st.session_state.get("out_m_selected_prov") or "").strip()
+                                        if _p and "省区" in _s.columns:
+                                            _s = _s[_s["省区"].astype(str).str.strip() == _p].copy()
+                                    if sel_big != "全部" and "产品大类" in _s.columns:
+                                        _s = _s[_s["产品大类"].astype(str).str.strip() == str(sel_big).strip()].copy()
+                                    if sel_small != "全部" and "重量" in _s.columns:
+                                        _sel_s = str(sel_small).strip()
+                                        _m = re.search(r"(\d{3})", _sel_s)
+                                        if _m:
+                                            _w = _s["重量"].astype(str).str.extract(r"(\d{3})")[0].fillna("").astype(str)
+                                            _s = _s[_w == _m.group(1)].copy()
+                                        else:
+                                            _s = _s[_s["重量"].astype(str).str.strip() == _sel_s].copy()
+                                    if not _s.empty and "箱数" in _s.columns:
+                                        if drill_level == 1:
+                                            _inv = _s.groupby("省区", as_index=False)["箱数"].sum()
+                                            _inv = _inv.rename(columns={"省区": view_dim, "箱数": "库存"})
+                                        else:
+                                            _inv = _s.groupby("经销商名称", as_index=False)["箱数"].sum()
+                                            _inv = _inv.rename(columns={"经销商名称": view_dim, "箱数": "库存"})
+                                        if view_dim in pv.columns and not _inv.empty:
+                                            pv = pv.merge(_inv, on=view_dim, how="left")
+                                            pv["库存"] = pd.to_numeric(pv.get("库存", 0), errors="coerce").fillna(0.0)
+                                            if avg_col in pv.columns:
+                                                _avg_v = pd.to_numeric(pv[avg_col], errors="coerce").fillna(0.0)
+                                                pv["可销月"] = np.where(_avg_v > 0, pv["库存"] / _avg_v, 0.0)
+                                                pv["可销月"] = pd.to_numeric(pv.get("可销月", 0), errors="coerce").fillna(0.0).round(1)
+
+                                if df_newcust_raw is not None and not getattr(df_newcust_raw, "empty", True) and "_ym" in df_newcust_raw.columns:
+                                    nc = df_newcust_raw.copy()
+                                    if "省区" in nc.columns:
+                                        nc["省区"] = nc["省区"].fillna("").astype(str).str.strip()
+                                    if "经销商名称" in nc.columns:
+                                        nc["经销商名称"] = nc["经销商名称"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                    if "门店名称" in nc.columns:
+                                        nc["门店名称"] = nc["门店名称"].fillna("").astype(str).str.strip()
+                                    if "新客数" in nc.columns:
+                                        nc["新客数"] = pd.to_numeric(nc["新客数"], errors="coerce").fillna(0.0)
+                                    nc["_ym"] = pd.to_numeric(nc["_ym"], errors="coerce").fillna(0).astype(int)
+                                    nc = nc[nc["_ym"].between(200001, 209912)].copy()
+                                    if drill_level == 2:
+                                        _p = str(st.session_state.get("out_m_selected_prov") or "").strip()
+                                        if _p and "省区" in nc.columns:
+                                            nc = nc[nc["省区"].astype(str).str.strip() == _p].copy()
+                                    elif drill_level == 3:
+                                        _p = str(st.session_state.get("out_m_selected_prov") or "").strip()
+                                        _d = str(st.session_state.get("out_m_selected_dist") or "").strip()
+                                        if _p and "省区" in nc.columns:
+                                            nc = nc[nc["省区"].astype(str).str.strip() == _p].copy()
+                                        if _d and "经销商名称" in nc.columns:
+                                            nc = nc[nc["经销商名称"].astype(str).str.replace(r"\s+", "", regex=True) == _d.replace(" ", "")].copy()
+                                    if not nc.empty:
+                                        latest_ym = int(pd.to_numeric(nc["_ym"], errors="coerce").fillna(0).max())
+                                        y = latest_ym // 100
+                                        m = latest_ym % 100
+                                        prev3 = []
+                                        for _ in range(3):
+                                            m -= 1
+                                            if m <= 0:
+                                                y -= 1
+                                                m += 12
+                                            prev3.append(int(y * 100 + m))
+                                        key_col = None
+                                        if drill_level == 1:
+                                            key_col = "省区"
+                                        elif drill_level == 2:
+                                            key_col = "经销商名称"
+                                        else:
+                                            key_col = "门店名称"
+                                        if key_col in nc.columns and view_dim in pv.columns:
+                                            cur = (
+                                                nc[nc["_ym"] == latest_ym]
+                                                .groupby(key_col, as_index=False)["新客数"]
+                                                .sum()
+                                                .rename(columns={key_col: view_dim, "新客数": "本月新客"})
+                                            )
+                                            p3 = (
+                                                nc[nc["_ym"].isin(prev3)]
+                                                .groupby(key_col, as_index=False)["新客数"]
+                                                .sum()
+                                                .rename(columns={key_col: view_dim, "新客数": "近三月新客"})
+                                            )
+                                            cum = (
+                                                nc[(nc["_ym"] >= 202501) & (nc["_ym"] <= latest_ym)]
+                                                .groupby(key_col, as_index=False)["新客数"]
+                                                .sum()
+                                                .rename(columns={key_col: view_dim, "新客数": "累计新客"})
+                                            )
+                                            pv[view_dim] = pv[view_dim].fillna("").astype(str).str.strip()
+                                            cur[view_dim] = cur[view_dim].fillna("").astype(str).str.strip()
+                                            p3[view_dim] = p3[view_dim].fillna("").astype(str).str.strip()
+                                            cum[view_dim] = cum[view_dim].fillna("").astype(str).str.strip()
+                                            pv = pv.merge(cur, on=view_dim, how="left")
+                                            pv = pv.merge(p3, on=view_dim, how="left")
+                                            pv = pv.merge(cum, on=view_dim, how="left")
+                                            for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                                if _c in pv.columns:
+                                                    pv[_c] = pd.to_numeric(pv[_c], errors="coerce").fillna(0.0)
+                                                else:
+                                                    pv[_c] = 0.0
+
+                                if df_scan_raw is not None and not getattr(df_scan_raw, "empty", True):
+                                    s = df_scan_raw.copy()
+                                    for _c in ["省区", "门店名称", "经销商名称", "产品大类", "产品小类"]:
+                                        if _c in s.columns:
+                                            if _c == "经销商名称":
+                                                s[_c] = s[_c].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                            else:
+                                                s[_c] = s[_c].fillna("").astype(str).str.strip()
+                                    if "年份" in s.columns:
+                                        s["年份"] = pd.to_numeric(s["年份"], errors="coerce").fillna(0).astype(int)
+                                    if "月份" in s.columns:
+                                        s["月份"] = pd.to_numeric(s["月份"], errors="coerce").fillna(0).astype(int)
+                                    s = s[(s.get("年份", 0) > 0) & (s.get("月份", 0).between(1, 12))].copy()
+                                    if drill_level == 2:
+                                        _p = str(st.session_state.get("out_m_selected_prov") or "").strip()
+                                        if _p and "省区" in s.columns:
+                                            s = s[s["省区"].astype(str).str.strip() == _p].copy()
+                                    elif drill_level == 3:
+                                        _p = str(st.session_state.get("out_m_selected_prov") or "").strip()
+                                        _d = str(st.session_state.get("out_m_selected_dist") or "").strip()
+                                        if _p and "省区" in s.columns:
+                                            s = s[s["省区"].astype(str).str.strip() == _p].copy()
+                                        if _d and "经销商名称" in s.columns:
+                                            s = s[s["经销商名称"].astype(str).str.replace(r"\s+", "", regex=True) == re.sub(r"\s+", "", _d)].copy()
+                                    if sel_big != "全部":
+                                        _sb = str(sel_big).strip()
+                                        if _sb == "雅系列":
+                                            if "产品小类" in s.columns:
+                                                s = s[s["产品小类"].astype(str).str.contains(r"(雅赋|雅耀|雅舒|雅护)", regex=True)].copy()
+                                            elif "产品大类" in s.columns:
+                                                s = s[s["产品大类"].astype(str).str.strip() == _sb].copy()
+                                        elif "产品大类" in s.columns:
+                                            s = s[s["产品大类"].astype(str).str.strip() == _sb].copy()
+                                    if sel_small != "全部" and "产品小类" in s.columns:
+                                        _sel_s = str(sel_small).strip()
+                                        _m = re.search(r"(\d{3})", _sel_s)
+                                        if _m:
+                                            _w = s["产品小类"].astype(str).str.extract(r"(\d{3})")[0].fillna("").astype(str)
+                                            s = s[_w == _m.group(1)].copy()
+                                        else:
+                                            s = s[s["产品小类"].astype(str).str.strip() == _sel_s].copy()
+                                    if not s.empty and view_dim in pv.columns:
+                                        s["_ym"] = (s["年份"] * 100 + s["月份"]).astype(int)
+                                        scan_ym = int(max(sel_yms)) if sel_yms else int(pd.to_numeric(s["_ym"], errors="coerce").fillna(0).max())
+                                        scan_label = ym_to_label.get(scan_ym)
+                                        if drill_level == 1:
+                                            key_col = "省区"
+                                        elif drill_level == 2:
+                                            key_col = "经销商名称"
+                                        else:
+                                            key_col = "门店名称"
+                                        if key_col in s.columns:
+                                            s_m = s[s["_ym"] == scan_ym].copy()
+                                            if not s_m.empty:
+                                                scan_agg = (
+                                                    s_m.groupby(key_col, as_index=False)
+                                                    .size()
+                                                    .rename(columns={key_col: view_dim, "size": "本月扫码听数"})
+                                                )
+                                                scan_agg["本月扫码"] = pd.to_numeric(scan_agg["本月扫码听数"], errors="coerce").fillna(0.0) / 6.0
+                                                scan_agg = scan_agg[[view_dim, "本月扫码"]].copy()
+                                                pv[view_dim] = pv[view_dim].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                                scan_agg[view_dim] = scan_agg[view_dim].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                                pv = pv.merge(scan_agg, on=view_dim, how="left")
+                                                pv["本月扫码"] = pd.to_numeric(pv.get("本月扫码", 0), errors="coerce").fillna(0.0)
+                                            else:
+                                                pv["本月扫码"] = 0.0
+                                        else:
+                                            pv["本月扫码"] = 0.0
+                                        if scan_label and scan_label in pv.columns:
+                                            _out_m = pd.to_numeric(pv[scan_label], errors="coerce").fillna(0.0)
+                                            pv["本月扫码率"] = np.where(_out_m > 0, pv["本月扫码"] / _out_m, 0.0)
+                                        else:
+                                            pv["本月扫码率"] = 0.0
+                                        pv["本月扫码率"] = pd.to_numeric(pv.get("本月扫码率", 0), errors="coerce").fillna(0.0)
+
                                 region_label = "全国省区"
                                 if drill_level == 2:
                                     region_label = str(st.session_state.get("out_m_selected_prov") or "").strip() or "省区"
@@ -6312,6 +6806,13 @@ if uploaded_file:
                                 export_cols += [c for c in first3_cols if c in pv.columns]
                                 if avg_col in pv.columns:
                                     export_cols.append(avg_col)
+                                if drill_level in (1, 2) and "库存" in pv.columns:
+                                    export_cols.append("库存")
+                                if drill_level in (1, 2) and "可销月" in pv.columns:
+                                    export_cols.append("可销月")
+                                for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                    if _c in pv.columns:
+                                        export_cols.append(_c)
                                 if "趋势" in pv.columns:
                                     export_cols.append("趋势")
                                 if "趋势类型" in pv.columns:
@@ -6329,8 +6830,12 @@ if uploaded_file:
                                         idx = export_cols.index(insert_after) + 1
                                         if diff_col not in export_cols:
                                             export_cols.insert(idx, diff_col)
-                                if "合计" in pv.columns:
-                                    export_cols.append("合计")
+                                if "完成率" in pv.columns:
+                                    export_cols.append("完成率")
+                                if "本月扫码" in pv.columns:
+                                    export_cols.append("本月扫码")
+                                if "本月扫码率" in pv.columns:
+                                    export_cols.append("本月扫码率")
 
                                 df_export = pv[export_cols].copy() if export_cols else pv.copy()
                                 if len(df_export) > 120:
@@ -6339,13 +6844,29 @@ if uploaded_file:
                                 try:
                                     total_export = {view_dim: "合计"}
                                     for _c in export_cols:
-                                        if _c in (view_dim, "趋势", "趋势类型", "_趋势数据"):
+                                        if _c in (view_dim, "趋势", "趋势类型", "_趋势数据", "可销月", "完成率", "本月扫码率"):
                                             continue
                                         if _c in pv.columns:
                                             total_export[_c] = float(pd.to_numeric(pv[_c], errors="coerce").fillna(0.0).sum())
                                     if avg_col in export_cols and avg_col in pv.columns and len(first3_cols) >= 1:
                                         _t3 = [float(pd.to_numeric(pv[c], errors="coerce").fillna(0.0).sum()) for c in first3_cols if c in pv.columns]
                                         total_export[avg_col] = float(np.mean(_t3)) if _t3 else 0.0
+                                    if "可销月" in export_cols:
+                                        _a = float(total_export.get(avg_col, 0.0) or 0.0)
+                                        _k = float(total_export.get("库存", 0.0) or 0.0)
+                                        total_export["可销月"] = round((_k / _a), 1) if _a > 0 else 0.0
+                                    if "完成率" in export_cols:
+                                        _feb = ym_to_label.get(202602)
+                                        _a = float(total_export.get(avg_col, 0.0) or 0.0)
+                                        _f = float(total_export.get(_feb, 0.0) or 0.0) if _feb else 0.0
+                                        total_export["完成率"] = (_f / _a) if _a > 0 else 0.0
+                                    if "本月扫码率" in export_cols and "本月扫码" in export_cols:
+                                        anchor_ym = int(max(sel_yms)) if sel_yms else None
+                                        scan_label_tot = ym_to_label.get(anchor_ym) if anchor_ym else None
+                                        denom = 0.0
+                                        if scan_label_tot and scan_label_tot in pv.columns:
+                                            denom = float(pd.to_numeric(pv[scan_label_tot], errors="coerce").fillna(0.0).sum())
+                                        total_export["本月扫码率"] = (float(total_export.get("本月扫码", 0.0) or 0.0) / denom) if denom > 0 else 0.0
                                     if "趋势" in export_cols:
                                         _spark_cols = trend_base_cols if 'trend_base_cols' in locals() and trend_base_cols else first3_cols
                                         _spark_vals = [float(pd.to_numeric(pv[c], errors="coerce").fillna(0.0).sum()) for c in _spark_cols if c in pv.columns]
@@ -6372,12 +6893,23 @@ if uploaded_file:
                                         col_types[c] = "num"
                                 if avg_col in df_export.columns:
                                     col_types[avg_col] = "num"
+                                if "库存" in df_export.columns:
+                                    col_types["库存"] = "num"
+                                if "可销月" in df_export.columns:
+                                    col_types["可销月"] = "num"
+                                if "完成率" in df_export.columns:
+                                    col_types["完成率"] = "pct"
+                                if "本月扫码" in df_export.columns:
+                                    col_types["本月扫码"] = "num"
+                                if "本月扫码率" in df_export.columns:
+                                    col_types["本月扫码率"] = "pct"
+                                for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                    if _c in df_export.columns:
+                                        col_types[_c] = "num"
                                 if diff_col in df_export.columns:
                                     col_types[diff_col] = "num"
                                 if last_col and last_col in df_export.columns:
                                     col_types[last_col] = "num"
-                                if "合计" in df_export.columns:
-                                    col_types["合计"] = "num"
                                 if "趋势" in df_export.columns:
                                     col_types["趋势"] = "spark"
                                 if "趋势类型" in df_export.columns:
@@ -6395,14 +6927,25 @@ if uploaded_file:
                                     cols += [c for c in first3_cols if c in pv.columns]
                                     if avg_col in pv.columns:
                                         cols.append(avg_col)
+                                    if drill_level in (1, 2) and "库存" in pv.columns:
+                                        cols.append("库存")
+                                    if drill_level in (1, 2) and "可销月" in pv.columns:
+                                        cols.append("可销月")
+                                    for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                        if _c in pv.columns:
+                                            cols.append(_c)
                                     if diff_col in pv.columns:
                                         cols.append(diff_col)
                                     if "趋势类型" in pv.columns:
                                         cols.append("趋势类型")
                                     if last_col and (last_col in pv.columns) and (last_col not in cols):
                                         cols.append(last_col)
-                                    if "合计" in pv.columns:
-                                        cols.append("合计")
+                                    if "完成率" in pv.columns:
+                                        cols.append("完成率")
+                                    if "本月扫码" in pv.columns:
+                                        cols.append("本月扫码")
+                                    if "本月扫码率" in pv.columns:
+                                        cols.append("本月扫码率")
                                     df_x = pv[cols].copy() if cols else pv.copy()
                                     if avg_col in df_x.columns:
                                         df_x.rename(columns={avg_col: avg_header}, inplace=True)
@@ -6437,11 +6980,22 @@ if uploaded_file:
                                     ordered += before
                                     if avg_header in df_x.columns:
                                         ordered.append(avg_header)
+                                    if "库存" in df_x.columns:
+                                        ordered.append("库存")
+                                    if "可销月" in df_x.columns:
+                                        ordered.append("可销月")
+                                    for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                        if _c in df_x.columns:
+                                            ordered.append(_c)
                                     if "趋势类型" in df_x.columns:
                                         ordered.append("趋势类型")
                                     ordered += after
-                                    if "合计" in df_x.columns:
-                                        ordered.append("合计")
+                                    if "完成率" in df_x.columns:
+                                        ordered.append("完成率")
+                                    if "本月扫码" in df_x.columns:
+                                        ordered.append("本月扫码")
+                                    if "本月扫码率" in df_x.columns:
+                                        ordered.append("本月扫码率")
                                     ordered = [c for c in ordered if c in df_x.columns]
                                     if ordered:
                                         df_x = df_x[ordered].copy()
@@ -6454,6 +7008,284 @@ if uploaded_file:
                                             df_x = df_x[ordered_cols].copy()
                                     return df_x
 
+                                def _build_dist_detail_df(all_provinces: bool):
+                                    d = df_trend_base.copy()
+                                    prov_sel = str(st.session_state.get("out_m_selected_prov") or "").strip()
+                                    if not all_provinces and prov_sel:
+                                        d = d[d["省区"].astype(str).str.strip() == prov_sel].copy()
+                                    if sel_big != '全部' and '_模块大类' in d.columns:
+                                        d = d[d['_模块大类'].astype(str).str.strip() == str(sel_big).strip()].copy()
+                                    if sel_small != '全部' and '_模块小类' in d.columns:
+                                        d = d[d['_模块小类'].astype(str).str.strip() == str(sel_small).strip()].copy()
+                                    if sel_prod and '_模块出库产品' in d.columns:
+                                        sel_prod_norm = [str(x).strip() for x in sel_prod if str(x).strip()]
+                                        if sel_prod_norm:
+                                            d = d[d['_模块出库产品'].astype(str).str.strip().isin(sel_prod_norm)].copy()
+                                    d = d[d["_ym"].isin(sel_yms)].copy()
+                                    if d.empty:
+                                        base_cols = ["省区", "经销商"] + sel_month_cols + [avg_header, "库存", "可销月", "距月均差额", "趋势类型", "完成率"]
+                                        return pd.DataFrame(columns=[c for c in base_cols if c])
+                                    d["数量(箱)"] = pd.to_numeric(d.get("数量(箱)", 0), errors="coerce").fillna(0.0)
+                                    d["省区"] = d["省区"].fillna("").astype(str).str.strip()
+                                    d["经销商名称"] = d["经销商名称"].fillna("").astype(str).str.strip()
+                                    d = d[(d["省区"] != "") & (d["经销商名称"] != "")].copy()
+                                    g = d.groupby(["省区", "经销商名称", "_ym"], as_index=False)["数量(箱)"].sum()
+                                    pv_s = g.pivot(index=["省区", "经销商名称"], columns="_ym", values="数量(箱)").fillna(0.0)
+                                    for ym in sel_yms:
+                                        if ym not in pv_s.columns:
+                                            pv_s[ym] = 0.0
+                                    pv_s = pv_s[sel_yms]
+                                    pv_s.columns = sel_month_cols
+                                    pv_s["_合计"] = pv_s.sum(axis=1)
+                                    pv_s = pv_s.reset_index().rename(columns={"经销商名称": "经销商"})
+                                    pv_s = pv_s.sort_values("_合计", ascending=False).reset_index(drop=True)
+                                    pv_s.drop(columns=["_合计"], inplace=True, errors="ignore")
+
+                                    tcols = [c for c in first3_cols if c in pv_s.columns]
+                                    if tcols:
+                                        pv_s[avg_header] = pv_s[tcols].mean(axis=1)
+                                    else:
+                                        pv_s[avg_header] = 0.0
+                                    if len(tcols) >= 3:
+                                        pv_s["趋势类型"] = pv_s.apply(lambda r: _trend_tag(r[tcols[0]], r[tcols[1]], r[tcols[2]]), axis=1)
+                                    else:
+                                        pv_s["趋势类型"] = "—"
+                                    if "距月均差额" not in pv_s.columns:
+                                        feb = ym_to_label.get(202602)
+                                        if feb and feb in pv_s.columns and avg_header in pv_s.columns:
+                                            pv_s["距月均差额"] = pd.to_numeric(pv_s[feb], errors="coerce").fillna(0.0) - pd.to_numeric(pv_s[avg_header], errors="coerce").fillna(0.0)
+
+                                    pv_s["库存"] = 0.0
+                                    if df_stock_raw is not None and not getattr(df_stock_raw, "empty", True):
+                                        _s = df_stock_raw.copy()
+                                        if "省区" not in _s.columns and "省区名称" in _s.columns:
+                                            _s["省区"] = _s["省区名称"]
+                                        for _c in ["省区", "经销商名称", "产品大类", "产品小类", "重量"]:
+                                            if _c in _s.columns:
+                                                if _c == "经销商名称":
+                                                    _s[_c] = _s[_c].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                                else:
+                                                    _s[_c] = _s[_c].fillna("").astype(str).str.strip()
+                                        if "箱数" in _s.columns:
+                                            _s["箱数"] = pd.to_numeric(_s["箱数"], errors="coerce").fillna(0.0)
+                                        if not all_provinces and prov_sel and "省区" in _s.columns:
+                                            _s = _s[_s["省区"].astype(str).str.strip() == prov_sel].copy()
+                                        if sel_big != "全部" and "产品大类" in _s.columns:
+                                            _s = _s[_s["产品大类"].astype(str).str.strip() == str(sel_big).strip()].copy()
+                                        if sel_small != "全部" and "重量" in _s.columns:
+                                            _sel_s = str(sel_small).strip()
+                                            _m = re.search(r"(\d{3})", _sel_s)
+                                            if _m:
+                                                _w = _s["重量"].astype(str).str.extract(r"(\d{3})")[0].fillna("").astype(str)
+                                                _s = _s[_w == _m.group(1)].copy()
+                                            else:
+                                                _s = _s[_s["重量"].astype(str).str.strip() == _sel_s].copy()
+                                        if not _s.empty and "箱数" in _s.columns:
+                                            _inv = _s.groupby(["省区", "经销商名称"], as_index=False)["箱数"].sum()
+                                            _inv = _inv.rename(columns={"经销商名称": "经销商", "箱数": "库存"})
+                                            pv_s = pv_s.merge(_inv, on=["省区", "经销商"], how="left", suffixes=("", "_y"))
+                                            if "库存_y" in pv_s.columns:
+                                                pv_s.drop(columns=["库存"], inplace=True, errors="ignore")
+                                                pv_s.rename(columns={"库存_y": "库存"}, inplace=True)
+                                            pv_s["库存"] = pd.to_numeric(pv_s.get("库存", 0), errors="coerce").fillna(0.0)
+
+                                    pv_s["可销月"] = 0.0
+                                    if avg_header in pv_s.columns and "库存" in pv_s.columns:
+                                        _avg_v = pd.to_numeric(pv_s[avg_header], errors="coerce").fillna(0.0)
+                                        pv_s["可销月"] = np.where(_avg_v > 0, pv_s["库存"] / _avg_v, 0.0)
+                                        pv_s["可销月"] = pd.to_numeric(pv_s.get("可销月", 0), errors="coerce").fillna(0.0).round(1)
+
+                                    pv_s["完成率"] = 0.0
+                                    feb = ym_to_label.get(202602)
+                                    if feb and feb in pv_s.columns and avg_header in pv_s.columns:
+                                        _avg_v = pd.to_numeric(pv_s[avg_header], errors="coerce").fillna(0.0)
+                                        _feb_v = pd.to_numeric(pv_s[feb], errors="coerce").fillna(0.0)
+                                        pv_s["完成率"] = np.where(_avg_v > 0, _feb_v / _avg_v, 0.0)
+
+                                    if df_newcust_raw is not None and not getattr(df_newcust_raw, "empty", True) and "_ym" in df_newcust_raw.columns:
+                                        nc = df_newcust_raw.copy()
+                                        if "省区" in nc.columns:
+                                            nc["省区"] = nc["省区"].fillna("").astype(str).str.strip()
+                                        if "经销商名称" in nc.columns:
+                                            nc["经销商名称"] = nc["经销商名称"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+
+                                        dist_map = {}
+                                        if df_stock_raw is not None and not getattr(df_stock_raw, "empty", True):
+                                            if "经销商全称" in df_stock_raw.columns and "经销商名称" in df_stock_raw.columns:
+                                                _m = (
+                                                    df_stock_raw[["经销商全称", "经销商名称"]]
+                                                    .dropna()
+                                                    .astype(str)
+                                                    .apply(lambda col: col.str.replace(r"\s+", "", regex=True))
+                                                    .drop_duplicates()
+                                                )
+                                                dist_map = dict(zip(_m["经销商全称"].tolist(), _m["经销商名称"].tolist()))
+
+                                        if "新客数" in nc.columns:
+                                            nc["新客数"] = pd.to_numeric(nc["新客数"], errors="coerce").fillna(0.0)
+                                        nc["_ym"] = pd.to_numeric(nc["_ym"], errors="coerce").fillna(0).astype(int)
+                                        nc = nc[nc["_ym"].between(200001, 209912)].copy()
+                                        if not all_provinces and prov_sel and "省区" in nc.columns:
+                                            nc = nc[nc["省区"].astype(str).str.strip() == prov_sel].copy()
+                                        if not nc.empty:
+                                            latest_ym = int(pd.to_numeric(nc["_ym"], errors="coerce").fillna(0).max())
+                                            y = latest_ym // 100
+                                            m = latest_ym % 100
+                                            prev3 = []
+                                            for _ in range(3):
+                                                m -= 1
+                                                if m <= 0:
+                                                    y -= 1
+                                                    m += 12
+                                                prev3.append(int(y * 100 + m))
+
+                                            pv_s["省区"] = pv_s["省区"].fillna("").astype(str).str.strip()
+                                            pv_s["经销商"] = pv_s["经销商"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                            pv_s["_经销商_key"] = pv_s["经销商"]
+                                            if dist_map:
+                                                pv_s["_经销商_key"] = pv_s["_经销商_key"].map(dist_map).fillna(pv_s["_经销商_key"])
+
+                                            nc["_经销商_key"] = nc["经销商名称"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                            if dist_map:
+                                                nc["_经销商_key"] = nc["_经销商_key"].map(dist_map).fillna(nc["_经销商_key"])
+
+                                            cur = (
+                                                nc[nc["_ym"] == latest_ym]
+                                                .groupby(["省区", "_经销商_key"], as_index=False)["新客数"]
+                                                .sum()
+                                                .rename(columns={"新客数": "本月新客"})
+                                            )
+                                            p3 = (
+                                                nc[nc["_ym"].isin(prev3)]
+                                                .groupby(["省区", "_经销商_key"], as_index=False)["新客数"]
+                                                .sum()
+                                                .rename(columns={"新客数": "近三月新客"})
+                                            )
+                                            cum = (
+                                                nc[(nc["_ym"] >= 202501) & (nc["_ym"] <= latest_ym)]
+                                                .groupby(["省区", "_经销商_key"], as_index=False)["新客数"]
+                                                .sum()
+                                                .rename(columns={"新客数": "累计新客"})
+                                            )
+                                            for _df in (cur, p3, cum):
+                                                _df["省区"] = _df["省区"].fillna("").astype(str).str.strip()
+
+                                            pv_s = pv_s.merge(cur, on=["省区", "_经销商_key"], how="left")
+                                            pv_s = pv_s.merge(p3, on=["省区", "_经销商_key"], how="left")
+                                            pv_s = pv_s.merge(cum, on=["省区", "_经销商_key"], how="left")
+                                            for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                                if _c in pv_s.columns:
+                                                    pv_s[_c] = pd.to_numeric(pv_s[_c], errors="coerce").fillna(0.0)
+                                                else:
+                                                    pv_s[_c] = 0.0
+                                            pv_s.drop(columns=["_经销商_key"], inplace=True, errors="ignore")
+
+                                    pv_s["本月扫码"] = 0.0
+                                    pv_s["本月扫码率"] = 0.0
+                                    anchor_ym = int(max(sel_yms)) if sel_yms else None
+                                    anchor_label = ym_to_label.get(anchor_ym) if anchor_ym else None
+                                    if anchor_ym and df_scan_raw is not None and not getattr(df_scan_raw, "empty", True):
+                                        s = df_scan_raw.copy()
+                                        for _c in ["省区", "经销商名称", "产品大类", "产品小类"]:
+                                            if _c in s.columns:
+                                                if _c == "经销商名称":
+                                                    s[_c] = s[_c].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                                else:
+                                                    s[_c] = s[_c].fillna("").astype(str).str.strip()
+                                        s["年份"] = pd.to_numeric(s.get("年份", 0), errors="coerce").fillna(0).astype(int)
+                                        s["月份"] = pd.to_numeric(s.get("月份", 0), errors="coerce").fillna(0).astype(int)
+                                        s = s[(s["年份"] > 0) & (s["月份"].between(1, 12))].copy()
+                                        if sel_big != "全部":
+                                            _sb = str(sel_big).strip()
+                                            if _sb == "雅系列":
+                                                if "产品小类" in s.columns:
+                                                    s = s[s["产品小类"].astype(str).str.contains(r"(雅赋|雅耀|雅舒|雅护)", regex=True)].copy()
+                                                elif "产品大类" in s.columns:
+                                                    s = s[s["产品大类"].astype(str).str.strip() == _sb].copy()
+                                            elif "产品大类" in s.columns:
+                                                s = s[s["产品大类"].astype(str).str.strip() == _sb].copy()
+                                        if sel_small != "全部" and "产品小类" in s.columns:
+                                            _sel_s = str(sel_small).strip()
+                                            _m = re.search(r"(\d{3})", _sel_s)
+                                            if _m:
+                                                _w = s["产品小类"].astype(str).str.extract(r"(\d{3})")[0].fillna("").astype(str)
+                                                s = s[_w == _m.group(1)].copy()
+                                            else:
+                                                s = s[s["产品小类"].astype(str).str.strip() == _sel_s].copy()
+                                        s["_ym"] = (s["年份"] * 100 + s["月份"]).astype(int)
+                                        s = s[s["_ym"] == anchor_ym].copy()
+                                        if not s.empty:
+                                            dist_map2 = {}
+                                            if df_stock_raw is not None and not getattr(df_stock_raw, "empty", True):
+                                                if "经销商全称" in df_stock_raw.columns and "经销商名称" in df_stock_raw.columns:
+                                                    _m2 = (
+                                                        df_stock_raw[["经销商全称", "经销商名称"]]
+                                                        .dropna()
+                                                        .astype(str)
+                                                        .apply(lambda col: col.str.replace(r"\s+", "", regex=True))
+                                                        .drop_duplicates()
+                                                    )
+                                                    dist_map2 = dict(zip(_m2["经销商全称"].tolist(), _m2["经销商名称"].tolist()))
+                                            pv_s["_经销商_key_scan"] = pv_s["经销商"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                            if dist_map2:
+                                                pv_s["_经销商_key_scan"] = pv_s["_经销商_key_scan"].map(dist_map2).fillna(pv_s["_经销商_key_scan"])
+                                            s["_经销商_key_scan"] = s["经销商名称"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                            if dist_map2:
+                                                s["_经销商_key_scan"] = s["_经销商_key_scan"].map(dist_map2).fillna(s["_经销商_key_scan"])
+                                            scan_agg = (
+                                                s.groupby(["省区", "_经销商_key_scan"], as_index=False)
+                                                .size()
+                                                .rename(columns={"size": "_扫码听数"})
+                                            )
+                                            scan_agg["本月扫码"] = pd.to_numeric(scan_agg["_扫码听数"], errors="coerce").fillna(0.0) / 6.0
+                                            scan_agg.drop(columns=["_扫码听数"], inplace=True, errors="ignore")
+                                            pv_s = pv_s.merge(scan_agg, on=["省区", "_经销商_key_scan"], how="left", suffixes=("", "_y"))
+                                            if "本月扫码_y" in pv_s.columns:
+                                                pv_s.drop(columns=["本月扫码"], inplace=True, errors="ignore")
+                                                pv_s.rename(columns={"本月扫码_y": "本月扫码"}, inplace=True)
+                                            pv_s["本月扫码"] = pd.to_numeric(pv_s.get("本月扫码", 0), errors="coerce").fillna(0.0)
+                                            pv_s.drop(columns=["_经销商_key_scan"], inplace=True, errors="ignore")
+                                    if anchor_label and anchor_label in pv_s.columns:
+                                        _out_m = pd.to_numeric(pv_s[anchor_label], errors="coerce").fillna(0.0)
+                                        pv_s["本月扫码率"] = np.where(_out_m > 0, pv_s["本月扫码"] / _out_m, 0.0)
+                                    else:
+                                        pv_s["本月扫码率"] = 0.0
+                                    pv_s["本月扫码率"] = pd.to_numeric(pv_s.get("本月扫码率", 0), errors="coerce").fillna(0.0)
+
+                                    months = [c for c in sel_month_cols if c in pv_s.columns]
+                                    anchor = tcols[-1] if tcols else (months[-1] if months else None)
+                                    before = []
+                                    after = []
+                                    if anchor and anchor in months:
+                                        idx = months.index(anchor)
+                                        before = months[: idx + 1]
+                                        after = months[idx + 1 :]
+                                    else:
+                                        before = months
+
+                                    ordered = ["省区", "经销商"]
+                                    ordered += before
+                                    ordered.append(avg_header)
+                                    ordered.append("库存")
+                                    ordered.append("可销月")
+                                    if "距月均差额" in pv_s.columns:
+                                        feb = ym_to_label.get(202602)
+                                        if feb and feb in ordered:
+                                            ordered.insert(ordered.index(feb) + 1, "距月均差额")
+                                    ordered.append("趋势类型")
+                                    ordered += after
+                                    for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                        if _c in pv_s.columns:
+                                            ordered.append(_c)
+                                    ordered.append("完成率")
+                                    if "本月扫码" in pv_s.columns:
+                                        ordered.append("本月扫码")
+                                    if "本月扫码率" in pv_s.columns:
+                                        ordered.append("本月扫码率")
+                                    ordered = [c for c in ordered if c in pv_s.columns]
+                                    pv_s = pv_s[ordered].copy()
+                                    return pv_s
+
                                 def _build_store_detail_df(all_provinces: bool):
                                     d = df_trend_base.copy()
                                     store_col = "_门店名" if "_门店名" in d.columns else ("门店名称" if "门店名称" in d.columns else None)
@@ -6463,7 +7295,7 @@ if uploaded_file:
                                             cols0.append(sel_month_cols[0])
                                         cols0 += [avg_header, "趋势类型"]
                                         cols0 += [c for c in sel_month_cols if sel_month_cols and c != sel_month_cols[0]]
-                                        cols0.append("合计")
+                                        cols0.append("完成率")
                                         cols0 = [c for c in cols0 if c]
                                         return pd.DataFrame(columns=cols0)
 
@@ -6485,7 +7317,7 @@ if uploaded_file:
 
                                     d = d[d["_ym"].isin(sel_yms)].copy()
                                     if d.empty:
-                                        return pd.DataFrame(columns=["省区", "经销商", "门店"] + sel_month_cols + ["合计"])
+                                        return pd.DataFrame(columns=["省区", "经销商", "门店"] + sel_month_cols + [avg_header, "距月均差额", "趋势类型", "完成率"])
 
                                     d["数量(箱)"] = pd.to_numeric(d.get("数量(箱)", 0), errors="coerce").fillna(0.0)
                                     d["省区"] = d["省区"].fillna("").astype(str).str.strip()
@@ -6500,9 +7332,10 @@ if uploaded_file:
                                             pv_s[ym] = 0.0
                                     pv_s = pv_s[sel_yms]
                                     pv_s.columns = sel_month_cols
-                                    pv_s["合计"] = pv_s.sum(axis=1)
+                                    pv_s["_合计"] = pv_s.sum(axis=1)
                                     pv_s = pv_s.reset_index().rename(columns={"经销商名称": "经销商", store_col: "门店"})
-                                    pv_s = pv_s.sort_values("合计", ascending=False).reset_index(drop=True)
+                                    pv_s = pv_s.sort_values("_合计", ascending=False).reset_index(drop=True)
+                                    pv_s.drop(columns=["_合计"], inplace=True, errors="ignore")
 
                                     tcols = [c for c in first3_cols if c in pv_s.columns]
                                     if tcols:
@@ -6517,6 +7350,136 @@ if uploaded_file:
                                         feb = ym_to_label.get(202602)
                                         if feb and feb in pv_s.columns and avg_header in pv_s.columns:
                                             pv_s["距月均差额"] = pd.to_numeric(pv_s[feb], errors="coerce").fillna(0.0) - pd.to_numeric(pv_s[avg_header], errors="coerce").fillna(0.0)
+
+                                    pv_s["完成率"] = 0.0
+                                    feb = ym_to_label.get(202602)
+                                    if feb and feb in pv_s.columns and avg_header in pv_s.columns:
+                                        _avg_v = pd.to_numeric(pv_s[avg_header], errors="coerce").fillna(0.0)
+                                        _feb_v = pd.to_numeric(pv_s[feb], errors="coerce").fillna(0.0)
+                                        pv_s["完成率"] = np.where(_avg_v > 0, _feb_v / _avg_v, 0.0)
+
+                                    if df_newcust_raw is not None and not getattr(df_newcust_raw, "empty", True) and "_ym" in df_newcust_raw.columns:
+                                        nc = df_newcust_raw.copy()
+                                        if "省区" in nc.columns:
+                                            nc["省区"] = nc["省区"].fillna("").astype(str).str.strip()
+                                        if "经销商名称" in nc.columns:
+                                            nc["经销商名称"] = nc["经销商名称"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                        if "门店名称" in nc.columns:
+                                            nc["门店名称"] = nc["门店名称"].fillna("").astype(str).str.strip()
+                                        if "新客数" in nc.columns:
+                                            nc["新客数"] = pd.to_numeric(nc["新客数"], errors="coerce").fillna(0.0)
+                                        nc["_ym"] = pd.to_numeric(nc["_ym"], errors="coerce").fillna(0).astype(int)
+                                        nc = nc[nc["_ym"].between(200001, 209912)].copy()
+                                        if not all_provinces and prov_sel and "省区" in nc.columns:
+                                            nc = nc[nc["省区"].astype(str).str.strip() == prov_sel].copy()
+                                        if drill_level == 3 and dist_sel and "经销商名称" in nc.columns:
+                                            nc = nc[nc["经销商名称"].astype(str).str.replace(r"\s+", "", regex=True) == dist_sel.replace(" ", "")].copy()
+                                        if not nc.empty:
+                                            latest_ym = int(pd.to_numeric(nc["_ym"], errors="coerce").fillna(0).max())
+                                            y = latest_ym // 100
+                                            m = latest_ym % 100
+                                            prev3 = []
+                                            for _ in range(3):
+                                                m -= 1
+                                                if m <= 0:
+                                                    y -= 1
+                                                    m += 12
+                                                prev3.append(int(y * 100 + m))
+                                            cur = nc[nc["_ym"] == latest_ym].groupby(["省区", "经销商名称", "门店名称"], as_index=False)["新客数"].sum().rename(columns={"经销商名称": "经销商", "门店名称": "门店", "新客数": "本月新客"})
+                                            p3 = nc[nc["_ym"].isin(prev3)].groupby(["省区", "经销商名称", "门店名称"], as_index=False)["新客数"].sum().rename(columns={"经销商名称": "经销商", "门店名称": "门店", "新客数": "近三月新客"})
+                                            cum = nc[(nc["_ym"] >= 202501) & (nc["_ym"] <= latest_ym)].groupby(["省区", "经销商名称", "门店名称"], as_index=False)["新客数"].sum().rename(columns={"经销商名称": "经销商", "门店名称": "门店", "新客数": "累计新客"})
+                                            for _df in (cur, p3, cum):
+                                                _df["省区"] = _df["省区"].fillna("").astype(str).str.strip()
+                                                _df["经销商"] = _df["经销商"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                                _df["门店"] = _df["门店"].fillna("").astype(str).str.strip()
+                                            pv_s["省区"] = pv_s["省区"].fillna("").astype(str).str.strip()
+                                            pv_s["经销商"] = pv_s["经销商"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                            pv_s["门店"] = pv_s["门店"].fillna("").astype(str).str.strip()
+                                            pv_s = pv_s.merge(cur, on=["省区", "经销商", "门店"], how="left")
+                                            pv_s = pv_s.merge(p3, on=["省区", "经销商", "门店"], how="left")
+                                            pv_s = pv_s.merge(cum, on=["省区", "经销商", "门店"], how="left")
+                                            for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                                if _c in pv_s.columns:
+                                                    pv_s[_c] = pd.to_numeric(pv_s[_c], errors="coerce").fillna(0.0)
+                                                else:
+                                                    pv_s[_c] = 0.0
+
+                                    pv_s["本月扫码"] = 0.0
+                                    pv_s["本月扫码率"] = 0.0
+                                    anchor_ym = int(max(sel_yms)) if sel_yms else None
+                                    anchor_label = ym_to_label.get(anchor_ym) if anchor_ym else None
+                                    if anchor_ym and df_scan_raw is not None and not getattr(df_scan_raw, "empty", True):
+                                        s = df_scan_raw.copy()
+                                        for _c in ["省区", "经销商名称", "门店名称", "产品大类", "产品小类"]:
+                                            if _c in s.columns:
+                                                if _c == "经销商名称":
+                                                    s[_c] = s[_c].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                                elif _c == "门店名称":
+                                                    s[_c] = s[_c].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                                else:
+                                                    s[_c] = s[_c].fillna("").astype(str).str.strip()
+                                        s["年份"] = pd.to_numeric(s.get("年份", 0), errors="coerce").fillna(0).astype(int)
+                                        s["月份"] = pd.to_numeric(s.get("月份", 0), errors="coerce").fillna(0).astype(int)
+                                        s = s[(s["年份"] > 0) & (s["月份"].between(1, 12))].copy()
+                                        if sel_big != "全部":
+                                            _sb = str(sel_big).strip()
+                                            if _sb == "雅系列":
+                                                if "产品小类" in s.columns:
+                                                    s = s[s["产品小类"].astype(str).str.contains(r"(雅赋|雅耀|雅舒|雅护)", regex=True)].copy()
+                                                elif "产品大类" in s.columns:
+                                                    s = s[s["产品大类"].astype(str).str.strip() == _sb].copy()
+                                            elif "产品大类" in s.columns:
+                                                s = s[s["产品大类"].astype(str).str.strip() == _sb].copy()
+                                        if sel_small != "全部" and "产品小类" in s.columns:
+                                            _sel_s = str(sel_small).strip()
+                                            _m = re.search(r"(\d{3})", _sel_s)
+                                            if _m:
+                                                _w = s["产品小类"].astype(str).str.extract(r"(\d{3})")[0].fillna("").astype(str)
+                                                s = s[_w == _m.group(1)].copy()
+                                            else:
+                                                s = s[s["产品小类"].astype(str).str.strip() == _sel_s].copy()
+                                        s["_ym"] = (s["年份"] * 100 + s["月份"]).astype(int)
+                                        s = s[s["_ym"] == anchor_ym].copy()
+                                        if not s.empty:
+                                            dist_map2 = {}
+                                            if df_stock_raw is not None and not getattr(df_stock_raw, "empty", True):
+                                                if "经销商全称" in df_stock_raw.columns and "经销商名称" in df_stock_raw.columns:
+                                                    _m2 = (
+                                                        df_stock_raw[["经销商全称", "经销商名称"]]
+                                                        .dropna()
+                                                        .astype(str)
+                                                        .apply(lambda col: col.str.replace(r"\s+", "", regex=True))
+                                                        .drop_duplicates()
+                                                    )
+                                                    dist_map2 = dict(zip(_m2["经销商全称"].tolist(), _m2["经销商名称"].tolist()))
+                                            pv_s["_经销商_key_scan"] = pv_s["经销商"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                            if dist_map2:
+                                                pv_s["_经销商_key_scan"] = pv_s["_经销商_key_scan"].map(dist_map2).fillna(pv_s["_经销商_key_scan"])
+                                            pv_s["_门店_key_scan"] = pv_s["门店"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                            s["_经销商_key_scan"] = s["经销商名称"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                            if dist_map2:
+                                                s["_经销商_key_scan"] = s["_经销商_key_scan"].map(dist_map2).fillna(s["_经销商_key_scan"])
+                                            s["_门店_key_scan"] = s["门店名称"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                            scan_agg = (
+                                                s.groupby(["省区", "_经销商_key_scan", "_门店_key_scan"], as_index=False)
+                                                .size()
+                                                .rename(columns={"size": "_扫码听数"})
+                                            )
+                                            scan_agg["本月扫码"] = pd.to_numeric(scan_agg["_扫码听数"], errors="coerce").fillna(0.0) / 6.0
+                                            scan_agg.drop(columns=["_扫码听数"], inplace=True, errors="ignore")
+                                            pv_s = pv_s.merge(scan_agg, left_on=["省区", "_经销商_key_scan", "_门店_key_scan"], right_on=["省区", "_经销商_key_scan", "_门店_key_scan"], how="left", suffixes=("", "_y"))
+                                            if "本月扫码_y" in pv_s.columns:
+                                                pv_s.drop(columns=["本月扫码"], inplace=True, errors="ignore")
+                                                pv_s.rename(columns={"本月扫码_y": "本月扫码"}, inplace=True)
+                                            pv_s["本月扫码"] = pd.to_numeric(pv_s.get("本月扫码", 0), errors="coerce").fillna(0.0)
+                                            pv_s.drop(columns=["_经销商_key_scan"], inplace=True, errors="ignore")
+                                            pv_s.drop(columns=["_门店_key_scan"], inplace=True, errors="ignore")
+                                    if anchor_label and anchor_label in pv_s.columns:
+                                        _out_m = pd.to_numeric(pv_s[anchor_label], errors="coerce").fillna(0.0)
+                                        pv_s["本月扫码率"] = np.where(_out_m > 0, pv_s["本月扫码"] / _out_m, 0.0)
+                                    else:
+                                        pv_s["本月扫码率"] = 0.0
+                                    pv_s["本月扫码率"] = pd.to_numeric(pv_s.get("本月扫码率", 0), errors="coerce").fillna(0.0)
 
                                     months = [c for c in sel_month_cols if c in pv_s.columns]
                                     anchor = tcols[-1] if tcols else (months[-1] if months else None)
@@ -6538,14 +7501,31 @@ if uploaded_file:
                                             ordered.insert(ordered.index(feb) + 1, "距月均差额")
                                     ordered.append("趋势类型")
                                     ordered += after
-                                    ordered.append("合计")
+                                    for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                        if _c in pv_s.columns:
+                                            ordered.append(_c)
+                                    ordered.append("完成率")
+                                    if "本月扫码" in pv_s.columns:
+                                        ordered.append("本月扫码")
+                                    if "本月扫码率" in pv_s.columns:
+                                        ordered.append("本月扫码率")
                                     ordered = [c for c in ordered if c in pv_s.columns]
                                     pv_s = pv_s[ordered].copy()
                                     return pv_s
 
                                 number_headers_current = set([c for c in first3_cols if c in pv.columns])
-                                number_headers_current |= {avg_header, last_col or "", "合计", "距月均差额"}
+                                number_headers_current |= {avg_header, last_col or "", "距月均差额", "库存", "可销月"}
                                 number_headers_current.discard("")
+                                for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                    if _c in pv.columns:
+                                        number_headers_current.add(_c)
+                                if "本月扫码" in pv.columns:
+                                    number_headers_current.add("本月扫码")
+                                percent_headers_current = set()
+                                if "完成率" in pv.columns:
+                                    percent_headers_current.add("完成率")
+                                if "本月扫码率" in pv.columns:
+                                    percent_headers_current.add("本月扫码率")
 
                                 if "out_m_excel_cache" not in st.session_state:
                                     st.session_state.out_m_excel_cache = {}
@@ -6554,10 +7534,12 @@ if uploaded_file:
                                 _prov_sel = str(st.session_state.get("out_m_selected_prov") or "").strip()
                                 _dist_sel = str(st.session_state.get("out_m_selected_dist") or "").strip()
                                 _prod_norm_key = tuple(sorted([str(x).strip() for x in (sel_prod or []) if str(x).strip()]))
+                                _excel_cache_ver = 4
 
                                 def _excel_key(kind: str):
                                     return (
                                         kind,
+                                        _excel_cache_ver,
                                         sig,
                                         int(drill_level),
                                         tuple(sel_yms),
@@ -6586,6 +7568,9 @@ if uploaded_file:
                                                     sheet_name="趋势分析",
                                                     title_lines=export_title_lines,
                                                     number_headers=number_headers_current,
+                                                    number_formats={"可销月": "0.0"},
+                                                    percent_headers=percent_headers_current,
+                                                    percent_formats={"完成率": "0.0%", "本月扫码率": "0.0%"},
                                                     trend_type_header="趋势类型",
                                                 )
                                                 _excel_cache[k_cur] = {
@@ -6603,9 +7588,50 @@ if uploaded_file:
                                             )
 
                                     k_all = _excel_key("all_store")
-                                    c_a1, c_a2, _ = st.columns([1.1, 1.9, 6.0])
+                                    k_all_dist = _excel_key("all_dist")
+                                    k_all_store = _excel_key("all_store")
+                                    c_a1, c_a2, c_a3, c_a4, _ = st.columns([1.5, 1.9, 1.6, 2.1, 3.0])
                                     with c_a1:
-                                        if st.button("生成导出全部", key=f"{export_id}_gen_all"):
+                                        if st.button("生成导出全部（经销商）", key=f"{export_id}_gen_all_dist"):
+                                            with st.spinner("正在生成导出全部（经销商），数据量较大请稍候…"):
+                                                df_all_dist = _build_dist_detail_df(all_provinces=True)
+                                                title_all_dist = [
+                                                    "月度出库趋势表 - 导出全部经销商",
+                                                    filter_line,
+                                                    "区域：全部省区（省区→经销商）",
+                                                    f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                                                ]
+                                                number_headers_all_dist = set(sel_month_cols + [avg_header, "库存", "可销月", "距月均差额"])
+                                                for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                                    if _c in df_all_dist.columns:
+                                                        number_headers_all_dist.add(_c)
+                                                if "本月扫码" in df_all_dist.columns:
+                                                    number_headers_all_dist.add("本月扫码")
+                                                xlsx_all_dist = _df_to_excel_bytes(
+                                                    df_all_dist,
+                                                    sheet_name="趋势分析",
+                                                    title_lines=title_all_dist,
+                                                    number_headers=number_headers_all_dist,
+                                                    number_formats={"可销月": "0.0"},
+                                                    percent_headers=set([x for x in ["完成率", "本月扫码率"] if x in df_all_dist.columns]),
+                                                    percent_formats={"完成率": "0.0%", "本月扫码率": "0.0%"},
+                                                    trend_type_header="趋势类型",
+                                                )
+                                                _excel_cache[k_all_dist] = {
+                                                    "bytes": xlsx_all_dist,
+                                                    "name": sanitize_filename(f"出库趋势分析_经销商_全部省区_{now_tag}.xlsx"),
+                                                }
+                                    with c_a2:
+                                        if k_all_dist in _excel_cache:
+                                            st.download_button(
+                                                "下载导出全部（经销商）",
+                                                data=_excel_cache[k_all_dist]["bytes"],
+                                                file_name=_excel_cache[k_all_dist]["name"],
+                                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                                key=f"{export_id}_dl_all_dist",
+                                            )
+                                    with c_a3:
+                                        if st.button("生成导出全部（门店）", key=f"{export_id}_gen_all_store"):
                                             with st.spinner("正在生成导出全部（门店明细），数据量较大请稍候…"):
                                                 df_all = _build_store_detail_df(all_provinces=True)
                                                 title_all = [
@@ -6614,26 +7640,33 @@ if uploaded_file:
                                                     "区域：全部省区（省区→经销商→门店）",
                                                     f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                                                 ]
-                                                number_headers_all = set(sel_month_cols + [avg_header, "距月均差额", "合计"])
+                                                number_headers_all = set(sel_month_cols + [avg_header, "距月均差额"])
+                                                for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                                    if _c in df_all.columns:
+                                                        number_headers_all.add(_c)
+                                                if "本月扫码" in df_all.columns:
+                                                    number_headers_all.add("本月扫码")
                                                 xlsx_all = _df_to_excel_bytes(
                                                     df_all,
                                                     sheet_name="趋势分析",
                                                     title_lines=title_all,
                                                     number_headers=number_headers_all,
+                                                    percent_headers=set([x for x in ["完成率", "本月扫码率"] if x in df_all.columns]),
+                                                    percent_formats={"完成率": "0.0%", "本月扫码率": "0.0%"},
                                                     trend_type_header="趋势类型",
                                                 )
-                                                _excel_cache[k_all] = {
+                                                _excel_cache[k_all_store] = {
                                                     "bytes": xlsx_all,
                                                     "name": sanitize_filename(f"出库趋势分析_门店明细_全部省区_{now_tag}.xlsx"),
                                                 }
-                                    with c_a2:
-                                        if k_all in _excel_cache:
+                                    with c_a4:
+                                        if k_all_store in _excel_cache:
                                             st.download_button(
-                                                "下载导出全部（门店明细）",
-                                                data=_excel_cache[k_all]["bytes"],
-                                                file_name=_excel_cache[k_all]["name"],
+                                                "下载导出全部（门店）",
+                                                data=_excel_cache[k_all_store]["bytes"],
+                                                file_name=_excel_cache[k_all_store]["name"],
                                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                                key=f"{export_id}_dl_all",
+                                                key=f"{export_id}_dl_all_store",
                                             )
                                 else:
                                     k_detail = _excel_key("detail_store")
@@ -6648,12 +7681,17 @@ if uploaded_file:
                                                     area_line,
                                                     f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                                                 ]
-                                                number_headers_detail = set(sel_month_cols + [avg_header, "距月均差额", "合计"])
+                                                number_headers_detail = set(sel_month_cols + [avg_header, "距月均差额"])
+                                                for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                                    if _c in df_detail.columns:
+                                                        number_headers_detail.add(_c)
                                                 xlsx_detail = _df_to_excel_bytes(
                                                     df_detail,
                                                     sheet_name="趋势分析",
                                                     title_lines=title_detail,
                                                     number_headers=number_headers_detail,
+                                                    percent_headers=set([x for x in ["完成率", "本月扫码率"] if x in df_detail.columns]),
+                                                    percent_formats={"完成率": "0.0%", "本月扫码率": "0.0%"},
                                                     trend_type_header="趋势类型",
                                                 )
                                                 _excel_cache[k_detail] = {
@@ -6760,12 +7798,180 @@ if uploaded_file:
                                             pv2[ym] = 0.0
                                     pv2 = pv2[sel_yms]
                                     pv2.columns = sel_month_cols
-                                    pv2["合计"] = pv2.sum(axis=1)
-                                    pv2 = pv2.sort_values("合计", ascending=False).reset_index()
+                                    pv2["_合计"] = pv2.sum(axis=1)
+                                    pv2 = pv2.sort_values("_合计", ascending=False).reset_index()
+                                    pv2.drop(columns=["_合计"], inplace=True, errors="ignore")
                                     pv2[avg_col] = pv2[first3_cols].mean(axis=1) if len(first3_cols) >= 1 else 0.0
                                     feb = ym_to_label.get(202602)
                                     if feb and feb in pv2.columns:
                                         pv2["距月均差额"] = pd.to_numeric(pv2[feb], errors="coerce").fillna(0.0) - pd.to_numeric(pv2[avg_col], errors="coerce").fillna(0.0)
+                                        _avg_v = pd.to_numeric(pv2[avg_col], errors="coerce").fillna(0.0)
+                                        _feb_v = pd.to_numeric(pv2[feb], errors="coerce").fillna(0.0)
+                                        pv2["完成率"] = np.where(_avg_v > 0, _feb_v / _avg_v, 0.0)
+                                    else:
+                                        pv2["完成率"] = 0.0
+
+                                    if level == 2 and df_stock_raw is not None and not getattr(df_stock_raw, "empty", True):
+                                        _s = df_stock_raw.copy()
+                                        if "省区" not in _s.columns and "省区名称" in _s.columns:
+                                            _s["省区"] = _s["省区名称"]
+                                        for _c in ["省区", "经销商名称", "产品大类", "产品小类", "重量"]:
+                                            if _c in _s.columns:
+                                                if _c == "经销商名称":
+                                                    _s[_c] = _s[_c].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                                else:
+                                                    _s[_c] = _s[_c].fillna("").astype(str).str.strip()
+                                        if "箱数" in _s.columns:
+                                            _s["箱数"] = pd.to_numeric(_s["箱数"], errors="coerce").fillna(0.0)
+                                        if prov and "省区" in _s.columns:
+                                            _s = _s[_s["省区"].astype(str).str.strip() == str(prov).strip()].copy()
+                                        if sel_big != "全部" and "产品大类" in _s.columns:
+                                            _s = _s[_s["产品大类"].astype(str).str.strip() == str(sel_big).strip()].copy()
+                                        if sel_small != "全部" and "重量" in _s.columns:
+                                            _sel_s = str(sel_small).strip()
+                                            _m = re.search(r"(\d{3})", _sel_s)
+                                            if _m:
+                                                _w = _s["重量"].astype(str).str.extract(r"(\d{3})")[0].fillna("").astype(str)
+                                                _s = _s[_w == _m.group(1)].copy()
+                                            else:
+                                                _s = _s[_s["重量"].astype(str).str.strip() == _sel_s].copy()
+                                        if not _s.empty and "箱数" in _s.columns:
+                                            _inv = _s.groupby("经销商名称", as_index=False)["箱数"].sum().rename(columns={"经销商名称": view, "箱数": "库存"})
+                                            if view in pv2.columns:
+                                                pv2 = pv2.merge(_inv, on=view, how="left")
+                                                pv2["库存"] = pd.to_numeric(pv2.get("库存", 0), errors="coerce").fillna(0.0)
+                                                _avg_v = pd.to_numeric(pv2[avg_col], errors="coerce").fillna(0.0)
+                                                pv2["可销月"] = np.where(_avg_v > 0, pv2["库存"] / _avg_v, 0.0)
+                                                pv2["可销月"] = pd.to_numeric(pv2.get("可销月", 0), errors="coerce").fillna(0.0).round(1)
+                                        else:
+                                            pv2["库存"] = 0.0
+                                            pv2["可销月"] = 0.0
+
+                                    if df_newcust_raw is not None and not getattr(df_newcust_raw, "empty", True) and "_ym" in df_newcust_raw.columns:
+                                        nc = df_newcust_raw.copy()
+                                        if "省区" in nc.columns:
+                                            nc["省区"] = nc["省区"].fillna("").astype(str).str.strip()
+                                        if "经销商名称" in nc.columns:
+                                            nc["经销商名称"] = nc["经销商名称"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                        if "门店名称" in nc.columns:
+                                            nc["门店名称"] = nc["门店名称"].fillna("").astype(str).str.strip()
+                                        if "新客数" in nc.columns:
+                                            nc["新客数"] = pd.to_numeric(nc["新客数"], errors="coerce").fillna(0.0)
+                                        nc["_ym"] = pd.to_numeric(nc["_ym"], errors="coerce").fillna(0).astype(int)
+                                        nc = nc[nc["_ym"].between(200001, 209912)].copy()
+                                        if prov and "省区" in nc.columns:
+                                            nc = nc[nc["省区"].astype(str).str.strip() == str(prov).strip()].copy()
+                                        if level == 3 and dist and "经销商名称" in nc.columns:
+                                            nc = nc[nc["经销商名称"].astype(str).str.replace(r"\s+", "", regex=True) == str(dist).strip().replace(" ", "")].copy()
+                                        if not nc.empty:
+                                            latest_ym = int(pd.to_numeric(nc["_ym"], errors="coerce").fillna(0).max())
+                                            y = latest_ym // 100
+                                            m = latest_ym % 100
+                                            prev3 = []
+                                            for _ in range(3):
+                                                m -= 1
+                                                if m <= 0:
+                                                    y -= 1
+                                                    m += 12
+                                                prev3.append(int(y * 100 + m))
+                                            key_col = "经销商名称" if level == 2 else "门店名称"
+                                            if key_col in nc.columns and view in pv2.columns:
+                                                cur = (
+                                                    nc[nc["_ym"] == latest_ym]
+                                                    .groupby(key_col, as_index=False)["新客数"]
+                                                    .sum()
+                                                    .rename(columns={key_col: view, "新客数": "本月新客"})
+                                                )
+                                                p3 = (
+                                                    nc[nc["_ym"].isin(prev3)]
+                                                    .groupby(key_col, as_index=False)["新客数"]
+                                                    .sum()
+                                                    .rename(columns={key_col: view, "新客数": "近三月新客"})
+                                                )
+                                                cum = (
+                                                    nc[(nc["_ym"] >= 202501) & (nc["_ym"] <= latest_ym)]
+                                                    .groupby(key_col, as_index=False)["新客数"]
+                                                    .sum()
+                                                    .rename(columns={key_col: view, "新客数": "累计新客"})
+                                                )
+                                                pv2[view] = pv2[view].fillna("").astype(str).str.strip()
+                                                cur[view] = cur[view].fillna("").astype(str).str.strip()
+                                                p3[view] = p3[view].fillna("").astype(str).str.strip()
+                                                cum[view] = cum[view].fillna("").astype(str).str.strip()
+                                                pv2 = pv2.merge(cur, on=view, how="left")
+                                                pv2 = pv2.merge(p3, on=view, how="left")
+                                                pv2 = pv2.merge(cum, on=view, how="left")
+                                                for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                                    if _c in pv2.columns:
+                                                        pv2[_c] = pd.to_numeric(pv2[_c], errors="coerce").fillna(0.0)
+                                                    else:
+                                                        pv2[_c] = 0.0
+                                    if df_scan_raw is not None and not getattr(df_scan_raw, "empty", True):
+                                        s = df_scan_raw.copy()
+                                        if "经销商名称" in s.columns:
+                                            s["经销商名称"] = s["经销商名称"].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                        if "省区" in s.columns:
+                                            s["省区"] = s["省区"].fillna("").astype(str).str.strip()
+                                        if "门店名称" in s.columns:
+                                            s["门店名称"] = s["门店名称"].fillna("").astype(str).str.strip()
+                                        if "产品大类" in s.columns:
+                                            s["产品大类"] = s["产品大类"].fillna("").astype(str).str.strip()
+                                        if "产品小类" in s.columns:
+                                            s["产品小类"] = s["产品小类"].fillna("").astype(str).str.strip()
+                                        s["年份"] = pd.to_numeric(s.get("年份", 0), errors="coerce").fillna(0).astype(int)
+                                        s["月份"] = pd.to_numeric(s.get("月份", 0), errors="coerce").fillna(0).astype(int)
+                                        s = s[(s["年份"] > 0) & (s["月份"].between(1, 12))].copy()
+                                        if prov and "省区" in s.columns:
+                                            s = s[s["省区"].astype(str).str.strip() == str(prov).strip()].copy()
+                                        if level == 3 and dist and "经销商名称" in s.columns:
+                                            _dist_norm = re.sub(r"\s+", "", str(dist).strip())
+                                            s = s[s["经销商名称"].astype(str).str.replace(r"\s+", "", regex=True) == _dist_norm].copy()
+                                        if sel_big != "全部":
+                                            _sb = str(sel_big).strip()
+                                            if _sb == "雅系列":
+                                                if "产品小类" in s.columns:
+                                                    s = s[s["产品小类"].astype(str).str.contains(r"(雅赋|雅耀|雅舒|雅护)", regex=True)].copy()
+                                                elif "产品大类" in s.columns:
+                                                    s = s[s["产品大类"].astype(str).str.strip() == _sb].copy()
+                                            elif "产品大类" in s.columns:
+                                                s = s[s["产品大类"].astype(str).str.strip() == _sb].copy()
+                                        if sel_small != "全部" and "产品小类" in s.columns:
+                                            _sel_s = str(sel_small).strip()
+                                            _m = re.search(r"(\d{3})", _sel_s)
+                                            if _m:
+                                                _w = s["产品小类"].astype(str).str.extract(r"(\d{3})")[0].fillna("").astype(str)
+                                                s = s[_w == _m.group(1)].copy()
+                                            else:
+                                                s = s[s["产品小类"].astype(str).str.strip() == _sel_s].copy()
+                                        if not s.empty and view in pv2.columns:
+                                            s["_ym"] = (s["年份"] * 100 + s["月份"]).astype(int)
+                                            scan_ym = int(max(sel_yms)) if sel_yms else int(pd.to_numeric(s["_ym"], errors="coerce").fillna(0).max())
+                                            scan_label = ym_to_label.get(scan_ym)
+                                            key_col = "经销商名称" if level == 2 else "门店名称"
+                                            pv2["本月扫码"] = 0.0
+                                            if key_col in s.columns:
+                                                s_m = s[s["_ym"] == scan_ym].copy()
+                                                if not s_m.empty:
+                                                    scan_agg = (
+                                                        s_m.groupby(key_col, as_index=False)
+                                                        .size()
+                                                        .rename(columns={key_col: view, "size": "本月扫码听数"})
+                                                    )
+                                                    scan_agg["本月扫码"] = pd.to_numeric(scan_agg["本月扫码听数"], errors="coerce").fillna(0.0) / 6.0
+                                                    scan_agg = scan_agg[[view, "本月扫码"]].copy()
+                                                    pv2[view] = pv2[view].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                                    scan_agg[view] = scan_agg[view].fillna("").astype(str).str.replace(r"\s+", "", regex=True)
+                                                    pv2 = pv2.merge(scan_agg, on=view, how="left", suffixes=("", "_y"))
+                                                    if "本月扫码_y" in pv2.columns:
+                                                        pv2.drop(columns=["本月扫码"], inplace=True, errors="ignore")
+                                                        pv2.rename(columns={"本月扫码_y": "本月扫码"}, inplace=True)
+                                                    pv2["本月扫码"] = pd.to_numeric(pv2["本月扫码"] if "本月扫码" in pv2.columns else 0.0, errors="coerce").fillna(0.0)
+                                            if scan_label and scan_label in pv2.columns:
+                                                _out_m = pd.to_numeric(pv2[scan_label], errors="coerce").fillna(0.0)
+                                                pv2["本月扫码率"] = np.where(_out_m > 0, pv2["本月扫码"] / _out_m, 0.0)
+                                            else:
+                                                pv2["本月扫码率"] = 0.0
+                                            pv2["本月扫码率"] = pd.to_numeric(pv2["本月扫码率"] if "本月扫码率" in pv2.columns else 0.0, errors="coerce").fillna(0.0)
                                     spark_vals2 = pv2[trend_base_cols].values.tolist() if trend_base_cols else [[] for _ in range(len(pv2))]
                                     pv2["_趋势数据"] = [json.dumps([float(x) for x in row]) for row in spark_vals2]
                                     pv2["趋势"] = pv2["_趋势数据"]
@@ -6802,25 +8008,52 @@ if uploaded_file:
                                                 export_cols_t += [c for c in first3_cols if c in pv_t.columns]
                                                 if avg_col in pv_t.columns:
                                                     export_cols_t.append(avg_col)
+                                                if "库存" in pv_t.columns:
+                                                    export_cols_t.append("库存")
+                                                if "可销月" in pv_t.columns:
+                                                    export_cols_t.append("可销月")
+                                                for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                                    if _c in pv_t.columns:
+                                                        export_cols_t.append(_c)
                                                 if "趋势" in pv_t.columns:
                                                     export_cols_t.append("趋势")
                                                 if "趋势类型" in pv_t.columns:
                                                     export_cols_t.append("趋势类型")
                                                 if last_col and (last_col in pv_t.columns) and (last_col not in export_cols_t):
                                                     export_cols_t.append(last_col)
-                                                if "合计" in pv_t.columns:
-                                                    export_cols_t.append("合计")
+                                                if "完成率" in pv_t.columns:
+                                                    export_cols_t.append("完成率")
+                                                if "本月扫码" in pv_t.columns:
+                                                    export_cols_t.append("本月扫码")
+                                                if "本月扫码率" in pv_t.columns:
+                                                    export_cols_t.append("本月扫码率")
                                                 df_t = pv_t[export_cols_t].copy()
 
                                                 try:
                                                     total_row = {v_t: "合计"}
                                                     for _c in export_cols_t:
-                                                        if _c in (v_t, "趋势", "趋势类型", "_趋势数据"):
+                                                        if _c in (v_t, "趋势", "趋势类型", "_趋势数据", "可销月", "完成率", "本月扫码率"):
                                                             continue
                                                         total_row[_c] = float(pd.to_numeric(pv_t[_c], errors="coerce").fillna(0.0).sum()) if _c in pv_t.columns else 0.0
                                                     if avg_col in export_cols_t and len(first3_cols) >= 1:
                                                         _t3 = [float(pd.to_numeric(pv_t[c], errors="coerce").fillna(0.0).sum()) for c in first3_cols if c in pv_t.columns]
                                                         total_row[avg_col] = float(np.mean(_t3)) if _t3 else 0.0
+                                                    if "可销月" in export_cols_t:
+                                                        _a = float(total_row.get(avg_col, 0.0) or 0.0)
+                                                        _k = float(total_row.get("库存", 0.0) or 0.0)
+                                                        total_row["可销月"] = round((_k / _a), 1) if _a > 0 else 0.0
+                                                    if "完成率" in export_cols_t:
+                                                        _feb = ym_to_label.get(202602)
+                                                        _a = float(total_row.get(avg_col, 0.0) or 0.0)
+                                                        _f = float(total_row.get(_feb, 0.0) or 0.0) if _feb else 0.0
+                                                        total_row["完成率"] = (_f / _a) if _a > 0 else 0.0
+                                                    if "本月扫码率" in export_cols_t and "本月扫码" in export_cols_t:
+                                                        anchor_ym = int(max(sel_yms)) if sel_yms else None
+                                                        scan_label_tot = ym_to_label.get(anchor_ym) if anchor_ym else None
+                                                        denom = 0.0
+                                                        if scan_label_tot and scan_label_tot in pv_t.columns:
+                                                            denom = float(pd.to_numeric(pv_t[scan_label_tot], errors="coerce").fillna(0.0).sum())
+                                                        total_row["本月扫码率"] = (float(total_row.get("本月扫码", 0.0) or 0.0) / denom) if denom > 0 else 0.0
                                                     if "趋势" in export_cols_t:
                                                         _spark_vals = [float(pd.to_numeric(pv_t[c], errors="coerce").fillna(0.0).sum()) for c in trend_base_cols if c in pv_t.columns]
                                                         total_row["趋势"] = json.dumps([float(x) for x in _spark_vals]) if _spark_vals else json.dumps([])
@@ -6840,10 +8073,21 @@ if uploaded_file:
                                                         col_types_t[c] = "num"
                                                 if avg_col in df_t.columns:
                                                     col_types_t[avg_col] = "num"
+                                                if "库存" in df_t.columns:
+                                                    col_types_t["库存"] = "num"
+                                                if "可销月" in df_t.columns:
+                                                    col_types_t["可销月"] = "num"
+                                                for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                                    if _c in df_t.columns:
+                                                        col_types_t[_c] = "num"
+                                                if "本月扫码" in df_t.columns:
+                                                    col_types_t["本月扫码"] = "num"
                                                 if last_col and last_col in df_t.columns:
                                                     col_types_t[last_col] = "num"
-                                                if "合计" in df_t.columns:
-                                                    col_types_t["合计"] = "num"
+                                                if "完成率" in df_t.columns:
+                                                    col_types_t["完成率"] = "pct"
+                                                if "本月扫码率" in df_t.columns:
+                                                    col_types_t["本月扫码率"] = "pct"
                                                 if "趋势" in df_t.columns:
                                                     col_types_t["趋势"] = "spark"
                                                 if "趋势类型" in df_t.columns:
@@ -6887,6 +8131,31 @@ if uploaded_file:
                                             "valueFormatter": JS_FMT_NUM,
                                             "width": 150,
                                         })
+                                        if drill_level in (1, 2) and "库存" in pv.columns:
+                                            month_first3_defs.append({
+                                                "headerName": "库存",
+                                                "field": "库存",
+                                                "type": ["numericColumn", "numberColumnFilter"],
+                                                "valueFormatter": JS_FMT_NUM,
+                                                "width": 120,
+                                            })
+                                        if drill_level in (1, 2) and "可销月" in pv.columns:
+                                            month_first3_defs.append({
+                                                "headerName": "可销月",
+                                                "field": "可销月",
+                                                "type": ["numericColumn", "numberColumnFilter"],
+                                                "valueFormatter": JS_FMT_NUM_1DP,
+                                                "width": 120,
+                                            })
+                                        for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                            if _c in pv.columns:
+                                                month_first3_defs.append({
+                                                    "headerName": _c,
+                                                    "field": _c,
+                                                    "type": ["numericColumn", "numberColumnFilter"],
+                                                    "valueFormatter": JS_FMT_NUM,
+                                                    "width": 120,
+                                                })
                                 if len(first3_cols) < 3:
                                     month_first3_defs.append({
                                         "headerName": avg_header,
@@ -6895,6 +8164,31 @@ if uploaded_file:
                                         "valueFormatter": JS_FMT_NUM,
                                         "width": 150,
                                     })
+                                    if drill_level in (1, 2) and "库存" in pv.columns:
+                                        month_first3_defs.append({
+                                            "headerName": "库存",
+                                            "field": "库存",
+                                            "type": ["numericColumn", "numberColumnFilter"],
+                                            "valueFormatter": JS_FMT_NUM,
+                                            "width": 120,
+                                        })
+                                    if drill_level in (1, 2) and "可销月" in pv.columns:
+                                        month_first3_defs.append({
+                                            "headerName": "可销月",
+                                            "field": "可销月",
+                                            "type": ["numericColumn", "numberColumnFilter"],
+                                            "valueFormatter": JS_FMT_NUM_1DP,
+                                            "width": 120,
+                                        })
+                                    for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                        if _c in pv.columns:
+                                            month_first3_defs.append({
+                                                "headerName": _c,
+                                                "field": _c,
+                                                "type": ["numericColumn", "numberColumnFilter"],
+                                                "valueFormatter": JS_FMT_NUM,
+                                                "width": 120,
+                                            })
                                 last_month_defs = []
                                 if last_col and last_col not in first3_cols:
                                     last_month_defs = [
@@ -6912,7 +8206,9 @@ if uploaded_file:
                                     {"headerName": "趋势", "field": "趋势", "cellRenderer": JS_SPARKLINE, "cellRendererParams": {"width": 120, "height": 28}, "width": 140},
                                     {"headerName": "趋势类型", "field": "趋势类型", "cellRenderer": JS_TREND_TAG, "width": 150},
                                     *last_month_defs,
-                                    {"headerName": "合计", "field": "合计", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 110},
+                                    {"headerName": "完成率", "field": "完成率", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_PCT_RATIO_1DP, "width": 110},
+                                    {"headerName": "本月扫码", "field": "本月扫码", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 120},
+                                    {"headerName": "本月扫码率", "field": "本月扫码率", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_PCT_RATIO_1DP, "width": 120},
                                     {"headerName": "_趋势数据", "field": "_趋势数据", "hide": True},
                                 ]
                                 col_defs = [col_defs[0], *month_first3_defs, *col_defs[1:]]
@@ -6933,7 +8229,7 @@ if uploaded_file:
                                                 )
                                                 break
 
-                                pinned_total = {view_dim: "合计"}
+                                pinned_total = {view_dim: "合计", "完成率": 0.0}
                                 try:
                                     _num_cols = []
                                     for _c in first3_cols:
@@ -6941,17 +8237,38 @@ if uploaded_file:
                                             _num_cols.append(_c)
                                     if avg_col in pv.columns:
                                         _num_cols.append(avg_col)
+                                    if "库存" in pv.columns:
+                                        _num_cols.append("库存")
                                     if last_col and last_col in pv.columns:
                                         _num_cols.append(last_col)
                                     if "距月均差额" in pv.columns:
                                         _num_cols.append("距月均差额")
-                                    if "合计" in pv.columns:
-                                        _num_cols.append("合计")
+                                    for _c in ["本月新客", "近三月新客", "累计新客"]:
+                                        if _c in pv.columns:
+                                            _num_cols.append(_c)
+                                    if "本月扫码" in pv.columns:
+                                        _num_cols.append("本月扫码")
                                     for _c in _num_cols:
                                         pinned_total[_c] = float(pd.to_numeric(pv[_c], errors="coerce").fillna(0.0).sum())
                                     if avg_col in pv.columns and len(first3_cols) >= 1:
                                         _t3 = [float(pd.to_numeric(pv[c], errors="coerce").fillna(0.0).sum()) for c in first3_cols if c in pv.columns]
                                         pinned_total[avg_col] = float(np.mean(_t3)) if _t3 else 0.0
+                                    if "库存" in pv.columns and avg_col in pv.columns:
+                                        _a = float(pinned_total.get(avg_col, 0.0) or 0.0)
+                                        _k = float(pinned_total.get("库存", 0.0) or 0.0)
+                                        pinned_total["可销月"] = round((_k / _a), 1) if _a > 0 else 0.0
+                                    _feb = ym_to_label.get(202602)
+                                    if _feb and _feb in pv.columns and avg_col in pv.columns:
+                                        _a = float(pinned_total.get(avg_col, 0.0) or 0.0)
+                                        _f = float(pinned_total.get(_feb, 0.0) or 0.0)
+                                        pinned_total["完成率"] = (_f / _a) if _a > 0 else 0.0
+                                    if "本月扫码率" in pv.columns and "本月扫码" in pv.columns:
+                                        anchor_ym = int(max(sel_yms)) if sel_yms else None
+                                        scan_label_tot = ym_to_label.get(anchor_ym) if anchor_ym else None
+                                        denom = 0.0
+                                        if scan_label_tot and scan_label_tot in pv.columns:
+                                            denom = float(pd.to_numeric(pv[scan_label_tot], errors="coerce").fillna(0.0).sum())
+                                        pinned_total["本月扫码率"] = (float(pinned_total.get("本月扫码", 0.0) or 0.0) / denom) if denom > 0 else 0.0
                                     _spark_cols = trend_base_cols if 'trend_base_cols' in locals() and trend_base_cols else first3_cols
                                     _spark_vals = [float(pd.to_numeric(pv[c], errors="coerce").fillna(0.0).sum()) for c in _spark_cols if c in pv.columns]
                                     _spark_json = json.dumps([float(x) for x in _spark_vals]) if _spark_vals else json.dumps([])
@@ -7115,15 +8432,41 @@ if uploaded_file:
                                     "中老年-目标值(提)",
                                     "中老年-出库值(提)",
                                     "中老年-今日出库(提)",
+                                    "本月新客",
+                                    "近三月新客",
+                                    "累计新客",
+                                    "本月扫码",
                                 ]
                                 seg_cols = [c for c in seg_cols if c in df_in.columns]
                                 g = df_in.groupby(group_col, as_index=False)[seg_cols].sum()
+                                if "库存" in df_in.columns:
+                                    if group_col == "省区" and "经销商名称" in df_in.columns:
+                                        _inv = (
+                                            df_in.groupby(["省区", "经销商名称"], as_index=False)["库存"]
+                                            .max()
+                                            .groupby("省区", as_index=False)["库存"]
+                                            .sum()
+                                        )
+                                        g = g.merge(_inv, on="省区", how="left")
+                                    else:
+                                        _inv = df_in.groupby(group_col, as_index=False)["库存"].max()
+                                        g = g.merge(_inv, on=group_col, how="left")
+                                    g["库存"] = pd.to_numeric(g.get("库存", 0), errors="coerce").fillna(0.0)
                                 if "段粉-目标值" in g.columns and "段粉-出库值" in g.columns:
                                     g["段粉-完成率"] = np.where(g["段粉-目标值"] > 0, g["段粉-出库值"] / g["段粉-目标值"], None)
                                 if "雅系列-目标值" in g.columns and "雅系列-出库值" in g.columns:
                                     g["雅系列-完成率"] = np.where(g["雅系列-目标值"] > 0, g["雅系列-出库值"] / g["雅系列-目标值"], None)
                                 if "中老年-目标值(提)" in g.columns and "中老年-出库值(提)" in g.columns:
                                     g["中老年-完成率"] = np.where(g["中老年-目标值(提)"] > 0, g["中老年-出库值(提)"] / g["中老年-目标值(提)"], None)
+                                if "本月扫码" in g.columns:
+                                    out_box = (
+                                        pd.to_numeric(g.get("段粉-出库值", 0), errors="coerce").fillna(0.0)
+                                        + pd.to_numeric(g.get("雅系列-出库值", 0), errors="coerce").fillna(0.0)
+                                        + (pd.to_numeric(g.get("中老年-出库值(提)", 0), errors="coerce").fillna(0.0) / 3.0)
+                                    )
+                                    scan_box = pd.to_numeric(g.get("本月扫码", 0), errors="coerce").fillna(0.0)
+                                    g["本月扫码率"] = np.where(out_box > 0, scan_box / out_box, 0.0)
+                                    g["本月扫码率"] = pd.to_numeric(g.get("本月扫码率", 0), errors="coerce").fillna(0.0)
                                 ordered = [
                                     group_col,
                                     "段粉-目标值",
@@ -7216,6 +8559,13 @@ if uploaded_file:
                                 r1 = (o1 / t1) if t1 > 0 else None
                                 r2 = (o2 / t2) if t2 > 0 else None
                                 r3 = (o3 / t3) if t3 > 0 else None
+                                inv = _sum_col("库存") if view_dim == "省区" else float(pd.to_numeric(df_in.get("库存", 0), errors="coerce").fillna(0).max()) if "库存" in df_in.columns else 0.0
+                                sc = _sum_col("本月扫码")
+                                nc1 = _sum_col("本月新客")
+                                nc3 = _sum_col("近三月新客")
+                                ncc = _sum_col("累计新客")
+                                out_box_total = o1 + o2 + (o3 / 3.0 if o3 else 0.0)
+                                sc_rate = (sc / out_box_total) if out_box_total > 0 else 0.0
                                 row = {
                                     view_dim: first_label,
                                     "段粉-目标值": t1,
@@ -7230,6 +8580,12 @@ if uploaded_file:
                                     "中老年-出库值(提)": o3,
                                     "中老年-完成率": r3,
                                     "中老年-今日出库(提)": td3,
+                                    "库存": inv,
+                                    "本月新客": nc1,
+                                    "近三月新客": nc3,
+                                    "累计新客": ncc,
+                                    "本月扫码": sc,
+                                    "本月扫码率": sc_rate,
                                 }
                                 if "省区" in df_in.columns and view_dim != "省区":
                                     row["省区"] = ""
@@ -7279,6 +8635,17 @@ if uploaded_file:
                                         {"headerName": "出库值", "field": "中老年-出库值(提)", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 130},
                                         {"headerName": "完成率", "field": "中老年-完成率", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_PCT_RATIO, "width": 110},
                                         {"headerName": ("今日出库\\n" + today_mmdd) if today_mmdd else "今日出库", "field": "中老年-今日出库(提)", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 120},
+                                    ],
+                                },
+                                {
+                                    "headerName": "趋势分析指标",
+                                    "children": [
+                                        {"headerName": "库存", "field": "库存", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 110},
+                                        {"headerName": "本月新客", "field": "本月新客", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 110},
+                                        {"headerName": "近三月新客", "field": "近三月新客", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 120},
+                                        {"headerName": "累计新客", "field": "累计新客", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 110},
+                                        {"headerName": "本月扫码", "field": "本月扫码", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_NUM, "width": 110},
+                                        {"headerName": "本月扫码率", "field": "本月扫码率", "type": ["numericColumn", "numberColumnFilter"], "valueFormatter": JS_FMT_PCT_RATIO, "width": 110},
                                     ],
                                 },
                             ]
